@@ -1,0 +1,21 @@
+# ── Generated / local-only databases ──────────────────────────────────────
+nuclear_capacity.db          # stale root-level empty artifact
+data/raw/                    # raw IAEA PRIS source files (large, not redistributed)
+data/processed/              # staging files from ingest
+
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# ── macOS ─────────────────────────────────────────────────────────────────
+.DS_Store
+
+# ── Editor / tooling ──────────────────────────────────────────────────────
+.claude/
+.env
+.venv/
+venv/
