@@ -41,6 +41,27 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ── Password gate ─────────────────────────────────────────────────────────
+def _check_password() -> bool:
+    """Show a password prompt and return True only when correct."""
+    if st.session_state.get("_authenticated"):
+        return True
+
+    st.markdown("## ⚛️ Nuclear Capacity Dashboard")
+    pwd = st.text_input("Password", type="password", key="_pwd_input",
+                        placeholder="Enter password to continue")
+    if st.button("Enter", type="primary"):
+        expected = st.secrets.get("APP_PASSWORD", "")
+        if pwd == expected:
+            st.session_state["_authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password — please try again.")
+    return False
+
+if not _check_password():
+    st.stop()
+
 # ── Custom CSS: widen sidebar to ~35% ─────────────────────────────────────
 st.markdown("""
 <style>

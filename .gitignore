@@ -19,3 +19,6 @@ build/
 .env
 .venv/
 venv/
+
+# ── Streamlit secrets (never commit — set in Streamlit Cloud UI instead) ──
+.streamlit/secrets.toml
