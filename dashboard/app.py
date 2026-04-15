@@ -275,20 +275,25 @@ def _build_scenario_export(
                     cell.font = Font(bold=True, color="1F4E79")
 
         # ── Sheet 2: Global Projection ────────────────────────────────────
-        df_global = proj_global[[
-            "year", "capacity_operating_gw",
-            "retirements_this_year_gw", "additions_this_year_gw",
-            "capacity_retired_ytd_gw", "capacity_added_ytd_gw", "is_bottom_up",
-        ]].copy()
-        df_global.columns = [
-            "Year", "Capacity (GW)", "Retirements (GW/yr)", "Additions (GW/yr)",
-            "Cumul. Retired (GW)", "Cumul. Added (GW)", "Bottom-Up Phase",
-        ]
+        _base_cols = ["year", "capacity_operating_gw",
+                      "retirements_this_year_gw", "additions_this_year_gw", "is_bottom_up"]
+        _ytd_cols  = ["capacity_retired_ytd_gw", "capacity_added_ytd_gw"]
+        _avail_ytd = [c for c in _ytd_cols if c in proj_global.columns]
+        df_global = proj_global[_base_cols[:4] + _avail_ytd + _base_cols[4:]].copy()
+        _col_names = ["Year", "Capacity (GW)", "Retirements (GW/yr)", "Additions (GW/yr)"]
+        if "capacity_retired_ytd_gw" in _avail_ytd:
+            _col_names.append("Cumul. Retired (GW)")
+        if "capacity_added_ytd_gw" in _avail_ytd:
+            _col_names.append("Cumul. Added (GW)")
+        _col_names.append("Bottom-Up Phase")
+        df_global.columns = _col_names
         df_global["Capacity (GW)"] = df_global["Capacity (GW)"].round(2)
         df_global["Retirements (GW/yr)"] = df_global["Retirements (GW/yr)"].round(3)
         df_global["Additions (GW/yr)"] = df_global["Additions (GW/yr)"].round(3)
-        df_global["Cumul. Retired (GW)"] = df_global["Cumul. Retired (GW)"].round(2)
-        df_global["Cumul. Added (GW)"] = df_global["Cumul. Added (GW)"].round(2)
+        if "Cumul. Retired (GW)" in df_global.columns:
+            df_global["Cumul. Retired (GW)"] = df_global["Cumul. Retired (GW)"].round(2)
+        if "Cumul. Added (GW)" in df_global.columns:
+            df_global["Cumul. Added (GW)"] = df_global["Cumul. Added (GW)"].round(2)
         df_global["Bottom-Up Phase"] = df_global["Bottom-Up Phase"].map({1: "Yes", 0: "No"})
         df_global.to_excel(writer, index=False, sheet_name="Global Projection")
         _style_sheet(writer.sheets["Global Projection"])
@@ -353,15 +358,23 @@ def _sum_projections(proj_dict: dict, regions: list) -> pd.DataFrame:
     """Sum per-region projection DataFrames across the given regions.
     Uses year-based groupby so misaligned or differently-sized DataFrames
     cannot cause silent positional errors."""
-    sum_cols = ["capacity_operating_gw", "retirements_this_year_gw", "additions_this_year_gw"]
-    dfs = [proj_dict[r][["year", "is_bottom_up"] + sum_cols]
+    sum_cols = [
+        "capacity_operating_gw", "retirements_this_year_gw", "additions_this_year_gw",
+        "capacity_retired_ytd_gw", "capacity_added_ytd_gw",
+    ]
+    # Only include columns that actually exist in the region DataFrames
+    sample = next((proj_dict[r] for r in regions if r in proj_dict and not proj_dict[r].empty), None)
+    if sample is None:
+        return pd.DataFrame()
+    available_sum_cols = [c for c in sum_cols if c in sample.columns]
+    dfs = [proj_dict[r][["year", "is_bottom_up"] + available_sum_cols]
            for r in regions if r in proj_dict and not proj_dict[r].empty]
     if not dfs:
         return pd.DataFrame()
     combined = pd.concat(dfs)
     # is_bottom_up is identical across regions for any given year — take max (1 > 0)
     ib = combined.groupby("year")["is_bottom_up"].max().reset_index()
-    summed = combined.groupby("year")[sum_cols].sum().reset_index()
+    summed = combined.groupby("year")[available_sum_cols].sum().reset_index()
     return summed.merge(ib, on="year")
 
 
