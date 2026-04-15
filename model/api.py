@@ -62,6 +62,66 @@ def get_all_scenarios(db_path: Path = DB_PATH) -> pd.DataFrame:
     return df
 
 
+# ── What-If projection ────────────────────────────────────────────────────
+
+def run_what_if_projection(
+    scenario_id: str,
+    what_if_overrides: dict,
+    region: str = "Global",
+    db_path: Path = DB_PATH,
+) -> pd.DataFrame:
+    """
+    Run a projection with in-memory reactor overrides and return results.
+    Does NOT write to the projections table — purely ephemeral.
+
+    what_if_overrides format:
+        { reactor_id: { field: value, ... }, ... }
+    Supported fields per reactor:
+        retirement_year (int)
+        status          (str)  e.g. "Restarted", "LongTermShutdown"
+        restart_date    (str)  e.g. "2028-01"
+        capacity_mw     (float)
+    """
+    conn = _conn(db_path)
+    rows = run_projection(
+        conn, scenario_id,
+        what_if_overrides=what_if_overrides,
+        write_to_db=False,
+    )
+    conn.close()
+    df = pd.DataFrame(rows)
+    if region != "Global":
+        df = df[df["region"] == region]
+    else:
+        df = df[df["region"] == "Global"]
+    return df[["year", "capacity_operating_gw", "retirements_this_year_gw",
+               "additions_this_year_gw", "is_bottom_up"]].sort_values("year")
+
+
+def get_reactor_options(
+    db_path: Path = DB_PATH,
+) -> pd.DataFrame:
+    """
+    Return reactors available for what-if overrides.
+    Includes Operating, Restarted, LongTermShutdown, and PermanentShutdown
+    (so users can model restarts of recently-closed plants).
+    Columns: reactor_id, name, country, region, status, net_capacity_mw,
+             retirement_date_used, restart_date, commercial_operation_date
+    """
+    conn = _conn(db_path)
+    df = pd.read_sql_query("""
+        SELECT reactor_id, name, country, region, status,
+               COALESCE(net_capacity_mw, 0) as net_capacity_mw,
+               retirement_date_used, restart_date,
+               commercial_operation_date
+        FROM reactors
+        WHERE status IN ('Operating','Restarted','LongTermShutdown','PermanentShutdown','Suspended')
+        ORDER BY region, country, name
+    """, conn)
+    conn.close()
+    return df
+
+
 # ── Historical data ────────────────────────────────────────────────────────
 
 def get_historical(

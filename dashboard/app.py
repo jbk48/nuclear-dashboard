@@ -21,6 +21,7 @@ from model.api import (
     write_and_run_custom_scenario, get_country_capacity,
     get_full_reactor_download, cleanup_stale_custom_scenarios,
     get_tech_projection, TECH_GROUPS,
+    run_what_if_projection, get_reactor_options,
 )
 from dashboard.charts import (
     chart1_global_projection,
@@ -30,6 +31,7 @@ from dashboard.charts import (
     chart6_additions,
     chart7_country_bar,
     chart_map,
+    chart_what_if_diff,
 )
 from dashboard.levers import render_lever_panel, ScenarioState, PRESET_DEFAULTS
 
@@ -574,13 +576,14 @@ if geo_filtered:
     )
 
 # ── Chart tabs ─────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab_wi = st.tabs([
     "📈 Global Projection",
     "📊 Capacity Breakdown",
     "📉 Retirements",
     "➕ New Additions",
     "🏳️ Country Snapshot",
     "🗺️ World Map",
+    "🔬 What-If",
 ])
 
 
@@ -1013,6 +1016,172 @@ with tab6:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
+
+
+# ── Tab 7: What-If ────────────────────────────────────────────────────────
+with tab_wi:
+    st.subheader("🔬 What-If Scenario Builder")
+    st.caption(
+        "Modify individual reactors — change retirement dates, restart shut-down units, "
+        "or adjust capacity — and instantly see the impact on the global projection. "
+        "Overrides are session-only and never affect the base scenarios."
+    )
+
+    # ── Initialise session state ──────────────────────────────────────────
+    if "wi_overrides" not in st.session_state:
+        st.session_state["wi_overrides"] = []   # list of override dicts
+    if "wi_result" not in st.session_state:
+        st.session_state["wi_result"] = None
+
+    # ── Load reactor options (cached) ─────────────────────────────────────
+    @st.cache_data(ttl=300)
+    def _load_reactor_options():
+        return get_reactor_options()
+
+    reactor_opts = _load_reactor_options()
+    # Build display label: "FLAMANVILLE-3 (France · Operating · 1.65 GW)"
+    reactor_opts["label"] = (
+        reactor_opts["name"] + " — " +
+        reactor_opts["country"] + " · " +
+        reactor_opts["status"] + " · " +
+        (reactor_opts["net_capacity_mw"] / 1000).round(2).astype(str) + " GW"
+    )
+    label_to_id = dict(zip(reactor_opts["label"], reactor_opts["reactor_id"]))
+    id_to_row   = reactor_opts.set_index("reactor_id").to_dict("index")
+
+    # ── Override builder form ─────────────────────────────────────────────
+    with st.expander("➕ Add a reactor override", expanded=True):
+        wi_col1, wi_col2, wi_col3 = st.columns([3, 2, 2])
+        with wi_col1:
+            selected_label = st.selectbox(
+                "Reactor", options=[""] + list(label_to_id.keys()),
+                key="wi_reactor_sel", label_visibility="collapsed",
+                placeholder="Search for a reactor…",
+            )
+        with wi_col2:
+            override_field = st.selectbox(
+                "Field", options=[
+                    "retirement_year",
+                    "restart_date",
+                    "status",
+                    "capacity_mw",
+                ],
+                key="wi_field_sel", label_visibility="collapsed",
+            )
+        with wi_col3:
+            override_value_raw = st.text_input(
+                "Value", key="wi_value_inp", label_visibility="collapsed",
+                placeholder="e.g. 2045  or  2028-06",
+            )
+
+        if st.button("➕ Add override", type="primary", key="wi_add_btn"):
+            if not selected_label:
+                st.warning("Select a reactor first.")
+            elif not override_value_raw.strip():
+                st.warning("Enter a value.")
+            else:
+                rid = label_to_id[selected_label]
+                # Type-coerce the value
+                try:
+                    if override_field in ("retirement_year",):
+                        val = int(override_value_raw.strip())
+                    elif override_field == "capacity_mw":
+                        val = float(override_value_raw.strip())
+                    else:
+                        val = override_value_raw.strip()
+                    # Prevent duplicate (same reactor + field)
+                    existing = st.session_state["wi_overrides"]
+                    existing = [o for o in existing
+                                if not (o["reactor_id"] == rid and o["field"] == override_field)]
+                    existing.append({
+                        "reactor_id":   rid,
+                        "reactor_name": id_to_row[rid]["name"],
+                        "country":      id_to_row[rid]["country"],
+                        "field":        override_field,
+                        "value":        val,
+                    })
+                    st.session_state["wi_overrides"] = existing
+                    st.session_state["wi_result"] = None  # clear stale result
+                    st.rerun()
+                except ValueError:
+                    st.error(f"Invalid value for {override_field}: '{override_value_raw}'")
+
+    # ── Current overrides table ───────────────────────────────────────────
+    overrides = st.session_state["wi_overrides"]
+    if overrides:
+        st.markdown("**Current overrides**")
+        for i, ov in enumerate(overrides):
+            c1, c2, c3, c4 = st.columns([3, 2, 2, 1])
+            c1.write(f"**{ov['reactor_name']}** ({ov['country']})")
+            c2.write(ov["field"].replace("_", " ").title())
+            c3.write(str(ov["value"]))
+            if c4.button("✕", key=f"wi_rm_{i}"):
+                st.session_state["wi_overrides"].pop(i)
+                st.session_state["wi_result"] = None
+                st.rerun()
+
+        st.markdown("")
+        run_col, clear_col = st.columns([2, 1])
+        with run_col:
+            run_wi = st.button("▶ Run What-If", type="primary", key="wi_run_btn",
+                               use_container_width=True)
+        with clear_col:
+            if st.button("🗑 Clear all", key="wi_clear_btn", use_container_width=True):
+                st.session_state["wi_overrides"] = []
+                st.session_state["wi_result"] = None
+                st.rerun()
+
+        if run_wi:
+            # Build override dict for the projection engine
+            wi_dict: dict = {}
+            for ov in overrides:
+                rid = ov["reactor_id"]
+                if rid not in wi_dict:
+                    wi_dict[rid] = {}
+                wi_dict[rid][ov["field"]] = ov["value"]
+
+            with st.spinner("Running what-if projection…"):
+                try:
+                    wi_proj = run_what_if_projection(
+                        scenario_id=_active_db_id,
+                        what_if_overrides=wi_dict,
+                        region="Global",
+                    )
+                    st.session_state["wi_result"] = wi_proj
+                except Exception as e:
+                    st.error(f"Projection failed: {e}")
+
+    else:
+        st.info("No overrides yet — use the form above to add your first one.")
+
+    # ── Results ───────────────────────────────────────────────────────────
+    if st.session_state.get("wi_result") is not None:
+        wi_proj   = st.session_state["wi_result"]
+        base_proj = proj_global_display[["year", "capacity_operating_gw",
+                                         "retirements_this_year_gw",
+                                         "additions_this_year_gw",
+                                         "is_bottom_up"]].copy()
+        fig_wi = chart_what_if_diff(
+            base_df=base_proj,
+            whatif_df=wi_proj,
+            base_label=f"{active_key.title()} (base)",
+            whatif_label="What-If",
+        )
+        st.plotly_chart(fig_wi, use_container_width=True)
+
+        # Summary delta table
+        delta_rows = []
+        for yr in [2030, 2035, 2040, 2050]:
+            b = base_proj.loc[base_proj["year"] == yr, "capacity_operating_gw"]
+            w = wi_proj.loc[wi_proj["year"] == yr, "capacity_operating_gw"]
+            if not b.empty and not w.empty:
+                delta = round(w.values[0] - b.values[0], 1)
+                delta_rows.append({"Year": yr,
+                                   "Base (GW)": round(b.values[0], 1),
+                                   "What-If (GW)": round(w.values[0], 1),
+                                   "Delta (GW)": f"{'+' if delta >= 0 else ''}{delta}"})
+        if delta_rows:
+            st.dataframe(delta_rows, hide_index=True, use_container_width=False)
 
 
 # ── Footer & Disclaimer ────────────────────────────────────────────────────

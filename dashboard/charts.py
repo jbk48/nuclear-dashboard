@@ -1007,3 +1007,91 @@ def chart_map(
         height=520,
     )
     return fig
+
+
+# ── What-If diff chart ────────────────────────────────────────────────────
+
+def chart_what_if_diff(
+    base_df: pd.DataFrame,
+    whatif_df: pd.DataFrame,
+    base_label: str = "Base scenario",
+    whatif_label: str = "What-If",
+) -> go.Figure:
+    """
+    Overlay the base scenario projection against a what-if variant.
+    Shades the gap between them to make the delta immediately visible.
+    """
+    fig = go.Figure()
+
+    base_color   = "#4a90d9"
+    whatif_color = "#e07b39"
+    fill_color   = "rgba(224,123,57,0.15)"
+
+    # Shaded fill between the two lines
+    fig.add_trace(go.Scatter(
+        x=list(base_df["year"]) + list(whatif_df["year"])[::-1],
+        y=list(base_df["capacity_operating_gw"]) +
+          list(whatif_df["capacity_operating_gw"])[::-1],
+        fill="toself",
+        fillcolor=fill_color,
+        line=dict(width=0),
+        showlegend=False,
+        hoverinfo="skip",
+    ))
+
+    # Base scenario line
+    fig.add_trace(go.Scatter(
+        x=base_df["year"],
+        y=base_df["capacity_operating_gw"],
+        name=base_label,
+        mode="lines",
+        line=dict(color=base_color, width=2.5),
+        hovertemplate=f"<b>{base_label}</b><br>%{{x}}: %{{y:.1f}} GW<extra></extra>",
+    ))
+
+    # What-if line
+    fig.add_trace(go.Scatter(
+        x=whatif_df["year"],
+        y=whatif_df["capacity_operating_gw"],
+        name=whatif_label,
+        mode="lines",
+        line=dict(color=whatif_color, width=2.5, dash="dot"),
+        hovertemplate=f"<b>{whatif_label}</b><br>%{{x}}: %{{y:.1f}} GW<extra></extra>",
+    ))
+
+    # Annotate net delta at 2030, 2040, 2050
+    for yr in [2030, 2040, 2050]:
+        b = base_df.loc[base_df["year"] == yr, "capacity_operating_gw"]
+        w = whatif_df.loc[whatif_df["year"] == yr, "capacity_operating_gw"]
+        if b.empty or w.empty:
+            continue
+        delta = round(w.values[0] - b.values[0], 1)
+        sign  = "+" if delta >= 0 else ""
+        fig.add_annotation(
+            x=yr,
+            y=max(b.values[0], w.values[0]),
+            text=f"{sign}{delta} GW",
+            showarrow=False,
+            yshift=12,
+            font=dict(size=11, color=whatif_color if delta != 0 else "#888"),
+        )
+
+    # Transition year marker
+    fig.add_vline(
+        x=_TRANSITION_YEAR, line_dash="dot",
+        line_color="#aaaaaa", line_width=1,
+        annotation_text="2040", annotation_position="top right",
+        annotation_font_size=10,
+    )
+
+    fig.update_layout(
+        title=dict(text="What-If Impact: Global Nuclear Capacity", font=dict(size=16)),
+        xaxis=dict(title="Year", range=[2024, 2050]),
+        yaxis=dict(title="Capacity (GW)"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        template=CHART_TEMPLATE,
+        font=FONT,
+        margin=dict(l=60, r=20, t=60, b=40),
+        height=420,
+    )
+    return fig

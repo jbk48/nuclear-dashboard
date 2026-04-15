@@ -85,6 +85,8 @@ def run_projection(
     scenario_id: str,
     start_year: int = BASELINE_YEAR,
     end_year: int = PROJECTION_END_YEAR,
+    what_if_overrides: dict | None = None,
+    write_to_db: bool = True,
 ) -> list[dict]:
     """
     Compute annual capacity projection for the given scenario.
@@ -113,6 +115,24 @@ def run_projection(
         WHERE status IN ('Operating', 'LongTermShutdown', 'Restarted')
     """)
     operating_fleet = cur.fetchall()
+
+    # ── Apply what-if overrides (in-memory only, DB untouched) ───────────
+    if what_if_overrides:
+        # Retirement year overrides feed directly into the schedule
+        for rid, ov in what_if_overrides.items():
+            if "retirement_year" in ov:
+                retirement_schedule[rid] = ov["retirement_year"]
+
+        # Fleet overrides: status / capacity / restart_date
+        new_fleet = []
+        for (rid, reg, status, cap_mw, restart_date) in operating_fleet:
+            if rid in what_if_overrides:
+                ov = what_if_overrides[rid]
+                status       = ov.get("status",       status)
+                cap_mw       = ov.get("capacity_mw",  cap_mw)
+                restart_date = ov.get("restart_date", restart_date)
+            new_fleet.append((rid, reg, status, cap_mw, restart_date))
+        operating_fleet = new_fleet
 
     # Group pipeline by (region, online_year) — for per-year reporting
     pipeline_by_region_year: dict[tuple, float] = defaultdict(float)
@@ -273,17 +293,18 @@ def run_projection(
                 "is_bottom_up":             is_bottom_up,
             })
 
-    # ── Write to DB ───────────────────────────────────────────────────────
-    cur.executemany("""
-        INSERT OR REPLACE INTO projections
-        (scenario_id, year, region, capacity_operating_gw,
-         capacity_retired_ytd_gw, capacity_added_ytd_gw,
-         retirements_this_year_gw, additions_this_year_gw,
-         adders_this_year_gw, is_bottom_up)
-        VALUES (:scenario_id, :year, :region, :capacity_operating_gw,
-                :capacity_retired_ytd_gw, :capacity_added_ytd_gw,
-                :retirements_this_year_gw, :additions_this_year_gw,
-                :adders_this_year_gw, :is_bottom_up)
-    """, results)
-    conn.commit()
+    # ── Write to DB (skipped for what-if runs) ────────────────────────────
+    if write_to_db:
+        cur.executemany("""
+            INSERT OR REPLACE INTO projections
+            (scenario_id, year, region, capacity_operating_gw,
+             capacity_retired_ytd_gw, capacity_added_ytd_gw,
+             retirements_this_year_gw, additions_this_year_gw,
+             adders_this_year_gw, is_bottom_up)
+            VALUES (:scenario_id, :year, :region, :capacity_operating_gw,
+                    :capacity_retired_ytd_gw, :capacity_added_ytd_gw,
+                    :retirements_this_year_gw, :additions_this_year_gw,
+                    :adders_this_year_gw, :is_bottom_up)
+        """, results)
+        conn.commit()
     return results
