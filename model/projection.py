@@ -114,25 +114,60 @@ def run_projection(
         FROM reactors
         WHERE status IN ('Operating', 'LongTermShutdown', 'Restarted')
     """)
-    operating_fleet = cur.fetchall()
+    operating_fleet = list(cur.fetchall())
 
     # ── Apply what-if overrides (in-memory only, DB untouched) ───────────
     if what_if_overrides:
+        reactor_overrides = {k: v for k, v in what_if_overrides.items()
+                             if k != "__synthetic__"}
+
         # Retirement year overrides feed directly into the schedule
-        for rid, ov in what_if_overrides.items():
+        for rid, ov in reactor_overrides.items():
             if "retirement_year" in ov:
                 retirement_schedule[rid] = ov["retirement_year"]
+
+        # Load any overridden reactors not currently in the operating fleet
+        # (e.g. PermanentShutdown units being restarted in the what-if)
+        fleet_ids = {r[0] for r in operating_fleet}
+        extra_ids = [rid for rid in reactor_overrides if rid not in fleet_ids]
+        if extra_ids:
+            placeholders = ",".join("?" * len(extra_ids))
+            cur.execute(f"""
+                SELECT reactor_id, region, status,
+                       COALESCE(restart_capacity_mw, net_capacity_mw, 0) as cap_mw,
+                       restart_date
+                FROM reactors WHERE reactor_id IN ({placeholders})
+            """, extra_ids)
+            operating_fleet.extend(cur.fetchall())
 
         # Fleet overrides: status / capacity / restart_date
         new_fleet = []
         for (rid, reg, status, cap_mw, restart_date) in operating_fleet:
-            if rid in what_if_overrides:
-                ov = what_if_overrides[rid]
+            if rid in reactor_overrides:
+                ov = reactor_overrides[rid]
                 status       = ov.get("status",       status)
                 cap_mw       = ov.get("capacity_mw",  cap_mw)
                 restart_date = ov.get("restart_date", restart_date)
             new_fleet.append((rid, reg, status, cap_mw, restart_date))
         operating_fleet = new_fleet
+
+        # Pipeline overrides: adjust effective_online_year or probability
+        if any("expected_online_year" in v or "pipeline_probability" in v
+               for v in reactor_overrides.values()):
+            new_pipeline = []
+            for r in pipeline:
+                rid = r.get("reactor_id")
+                if rid and rid in reactor_overrides:
+                    ov = reactor_overrides[rid]
+                    r = dict(r)
+                    if "expected_online_year" in ov:
+                        r["effective_online_year"] = int(ov["expected_online_year"])
+                    if "pipeline_probability" in ov:
+                        r["expected_capacity_mw"] = (
+                            r.get("net_capacity_mw", 0) * float(ov["pipeline_probability"])
+                        )
+                new_pipeline.append(r)
+            pipeline = new_pipeline
 
     # Group pipeline by (region, online_year) — for per-year reporting
     pipeline_by_region_year: dict[tuple, float] = defaultdict(float)
@@ -142,6 +177,18 @@ def run_projection(
         mw  = r["expected_capacity_mw"]
         if yr and reg and mw:
             pipeline_by_region_year[(reg, yr)] += mw
+
+    # ── Inject synthetic new-build batches ────────────────────────────────
+    if what_if_overrides and "__synthetic__" in what_if_overrides:
+        for batch in what_if_overrides["__synthetic__"]:
+            reg      = batch.get("region")
+            cap_mw   = float(batch.get("capacity_mw", 0))
+            per_year = int(batch.get("per_year", 1))
+            start    = int(batch.get("start_year", BASELINE_YEAR + 1))
+            n_years  = int(batch.get("n_years", 1))
+            if reg and cap_mw > 0:
+                for yr_offset in range(n_years):
+                    pipeline_by_region_year[(reg, start + yr_offset)] += cap_mw * per_year
 
     # Precompute cumulative pipeline MW per region — for every (region, year) pair
     # we want the total expected capacity that has come online *through* that year.

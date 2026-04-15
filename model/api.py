@@ -113,9 +113,14 @@ def get_reactor_options(
         SELECT reactor_id, name, country, region, status,
                COALESCE(net_capacity_mw, 0) as net_capacity_mw,
                retirement_date_used, restart_date,
-               commercial_operation_date
+               commercial_operation_date,
+               expected_online_year
         FROM reactors
-        WHERE status IN ('Operating','Restarted','LongTermShutdown','PermanentShutdown','Suspended')
+        WHERE status IN (
+            'Operating','Restarted','LongTermShutdown',
+            'PermanentShutdown','Suspended',
+            'UnderConstruction','Planned','Proposed'
+        )
         ORDER BY region, country, name
     """, conn)
     conn.close()

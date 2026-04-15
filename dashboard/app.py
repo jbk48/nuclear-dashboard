@@ -1041,10 +1041,12 @@ with tab_wi:
     )
 
     # ── Initialise session state ──────────────────────────────────────────
-    if "wi_overrides" not in st.session_state:
-        st.session_state["wi_overrides"] = []   # list of override dicts
-    if "wi_result" not in st.session_state:
-        st.session_state["wi_result"] = None
+    if "wi_overrides"  not in st.session_state:
+        st.session_state["wi_overrides"]  = []
+    if "wi_synthetic"  not in st.session_state:
+        st.session_state["wi_synthetic"]  = []
+    if "wi_result"     not in st.session_state:
+        st.session_state["wi_result"]     = None
 
     # ── Load reactor options (cached) ─────────────────────────────────────
     @st.cache_data(ttl=300)
@@ -1052,7 +1054,6 @@ with tab_wi:
         return get_reactor_options()
 
     reactor_opts = _load_reactor_options()
-    # Build display label: "FLAMANVILLE-3 (France · Operating · 1.65 GW)"
     reactor_opts["label"] = (
         reactor_opts["name"] + " — " +
         reactor_opts["country"] + " · " +
@@ -1061,6 +1062,11 @@ with tab_wi:
     )
     label_to_id = dict(zip(reactor_opts["label"], reactor_opts["reactor_id"]))
     id_to_row   = reactor_opts.set_index("reactor_id").to_dict("index")
+
+    # Fields available depend on reactor status
+    _PIPELINE_STATUSES = {"UnderConstruction", "Planned", "Proposed"}
+    _FLEET_FIELDS    = ["retirement_year", "restart_date", "status", "capacity_mw"]
+    _PIPELINE_FIELDS = ["expected_online_year", "pipeline_probability", "capacity_mw"]
 
     # ── Override builder form ─────────────────────────────────────────────
     with st.expander("➕ Add a reactor override", expanded=True):
@@ -1071,20 +1077,28 @@ with tab_wi:
                 key="wi_reactor_sel", label_visibility="collapsed",
                 placeholder="Search for a reactor…",
             )
+        # Choose field options based on selected reactor's status
+        _sel_status = (id_to_row[label_to_id[selected_label]]["status"]
+                       if selected_label else None)
+        _field_opts = (_PIPELINE_FIELDS if _sel_status in _PIPELINE_STATUSES
+                       else _FLEET_FIELDS)
         with wi_col2:
             override_field = st.selectbox(
-                "Field", options=[
-                    "retirement_year",
-                    "restart_date",
-                    "status",
-                    "capacity_mw",
-                ],
+                "Field", options=_field_opts,
                 key="wi_field_sel", label_visibility="collapsed",
             )
+        _placeholders = {
+            "retirement_year":      "e.g. 2045",
+            "restart_date":         "e.g. 2028-06",
+            "status":               "e.g. Restarted",
+            "capacity_mw":          "e.g. 900",
+            "expected_online_year": "e.g. 2032",
+            "pipeline_probability": "0.0 – 1.0",
+        }
         with wi_col3:
             override_value_raw = st.text_input(
                 "Value", key="wi_value_inp", label_visibility="collapsed",
-                placeholder="e.g. 2045  or  2028-06",
+                placeholder=_placeholders.get(override_field, "value"),
             )
 
         if st.button("➕ Add override", type="primary", key="wi_add_btn"):
@@ -1094,15 +1108,13 @@ with tab_wi:
                 st.warning("Enter a value.")
             else:
                 rid = label_to_id[selected_label]
-                # Type-coerce the value
                 try:
-                    if override_field in ("retirement_year",):
+                    if override_field in ("retirement_year", "expected_online_year"):
                         val = int(override_value_raw.strip())
-                    elif override_field == "capacity_mw":
+                    elif override_field in ("capacity_mw", "pipeline_probability"):
                         val = float(override_value_raw.strip())
                     else:
                         val = override_value_raw.strip()
-                    # Prevent duplicate (same reactor + field)
                     existing = st.session_state["wi_overrides"]
                     existing = [o for o in existing
                                 if not (o["reactor_id"] == rid and o["field"] == override_field)]
@@ -1114,24 +1126,75 @@ with tab_wi:
                         "value":        val,
                     })
                     st.session_state["wi_overrides"] = existing
-                    st.session_state["wi_result"] = None  # clear stale result
+                    st.session_state["wi_result"] = None
                     st.rerun()
                 except ValueError:
                     st.error(f"Invalid value for {override_field}: '{override_value_raw}'")
 
-    # ── Current overrides table ───────────────────────────────────────────
-    overrides = st.session_state["wi_overrides"]
-    if overrides:
-        st.markdown("**Current overrides**")
-        for i, ov in enumerate(overrides):
-            c1, c2, c3, c4 = st.columns([3, 2, 2, 1])
-            c1.write(f"**{ov['reactor_name']}** ({ov['country']})")
-            c2.write(ov["field"].replace("_", " ").title())
-            c3.write(str(ov["value"]))
-            if c4.button("✕", key=f"wi_rm_{i}"):
-                st.session_state["wi_overrides"].pop(i)
-                st.session_state["wi_result"] = None
-                st.rerun()
+    # ── Synthetic new-build batch form ────────────────────────────────────
+    with st.expander("🏗 Add a synthetic new-build batch", expanded=False):
+        st.caption("Model hypothetical reactors not in the database — e.g. 'what if the US built 3 × 300 MW reactors per year starting 2033?'")
+        sb_c1, sb_c2, sb_c3, sb_c4, sb_c5 = st.columns([2, 1, 1, 1, 1])
+        with sb_c1:
+            sb_region = st.selectbox("Region", options=REGIONS, key="wi_sb_region",
+                                     label_visibility="collapsed")
+        with sb_c2:
+            sb_cap = st.number_input("MW each", min_value=10, max_value=10000,
+                                     value=300, step=50, key="wi_sb_cap",
+                                     label_visibility="collapsed")
+        with sb_c3:
+            sb_per_yr = st.number_input("Per year", min_value=1, max_value=50,
+                                        value=3, step=1, key="wi_sb_per_yr",
+                                        label_visibility="collapsed")
+        with sb_c4:
+            sb_start = st.number_input("Start year", min_value=2025, max_value=2049,
+                                       value=2030, step=1, key="wi_sb_start",
+                                       label_visibility="collapsed")
+        with sb_c5:
+            sb_nyrs = st.number_input("For N years", min_value=1, max_value=20,
+                                      value=5, step=1, key="wi_sb_nyrs",
+                                      label_visibility="collapsed")
+        st.caption(f"Region · MW each · Per year · Start year · For N years  →  adds **{int(sb_per_yr) * int(sb_cap) / 1000:.1f} GW/yr** in **{sb_region}** for {int(sb_nyrs)} year(s) from {int(sb_start)}")
+        if st.button("➕ Add batch", key="wi_sb_add", type="primary"):
+            label = f"{int(sb_per_yr)} × {int(sb_cap)} MW/yr in {sb_region} from {int(sb_start)} ({int(sb_nyrs)} yr)"
+            st.session_state["wi_synthetic"].append({
+                "label":      label,
+                "region":     sb_region,
+                "capacity_mw": float(sb_cap),
+                "per_year":   int(sb_per_yr),
+                "start_year": int(sb_start),
+                "n_years":    int(sb_nyrs),
+            })
+            st.session_state["wi_result"] = None
+            st.rerun()
+
+    # ── Current overrides + synthetic table ──────────────────────────────
+    overrides  = st.session_state["wi_overrides"]
+    synthetic  = st.session_state["wi_synthetic"]
+    has_any    = overrides or synthetic
+
+    if has_any:
+        if overrides:
+            st.markdown("**Reactor overrides**")
+            for i, ov in enumerate(overrides):
+                c1, c2, c3, c4 = st.columns([3, 2, 2, 1])
+                c1.write(f"**{ov['reactor_name']}** ({ov['country']})")
+                c2.write(ov["field"].replace("_", " ").title())
+                c3.write(str(ov["value"]))
+                if c4.button("✕", key=f"wi_rm_{i}"):
+                    st.session_state["wi_overrides"].pop(i)
+                    st.session_state["wi_result"] = None
+                    st.rerun()
+
+        if synthetic:
+            st.markdown("**Synthetic new builds**")
+            for i, sb in enumerate(synthetic):
+                sc1, sc2 = st.columns([6, 1])
+                sc1.write(sb["label"])
+                if sc2.button("✕", key=f"wi_sb_rm_{i}"):
+                    st.session_state["wi_synthetic"].pop(i)
+                    st.session_state["wi_result"] = None
+                    st.rerun()
 
         st.markdown("")
         run_col, clear_col = st.columns([2, 1])
@@ -1141,17 +1204,19 @@ with tab_wi:
         with clear_col:
             if st.button("🗑 Clear all", key="wi_clear_btn", use_container_width=True):
                 st.session_state["wi_overrides"] = []
-                st.session_state["wi_result"] = None
+                st.session_state["wi_synthetic"] = []
+                st.session_state["wi_result"]    = None
                 st.rerun()
 
         if run_wi:
-            # Build override dict for the projection engine
             wi_dict: dict = {}
             for ov in overrides:
                 rid = ov["reactor_id"]
                 if rid not in wi_dict:
                     wi_dict[rid] = {}
                 wi_dict[rid][ov["field"]] = ov["value"]
+            if synthetic:
+                wi_dict["__synthetic__"] = synthetic
 
             with st.spinner("Running what-if projection…"):
                 try:
@@ -1165,7 +1230,7 @@ with tab_wi:
                     st.error(f"Projection failed: {e}")
 
     else:
-        st.info("No overrides yet — use the form above to add your first one.")
+        st.info("No overrides yet — add a reactor override or a synthetic new-build batch above.")
 
     # ── Results ───────────────────────────────────────────────────────────
     if st.session_state.get("wi_result") is not None:
