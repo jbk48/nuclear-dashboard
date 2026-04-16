@@ -34,7 +34,7 @@ from dashboard.charts import (
     chart_map,
     chart_what_if_diff,
 )
-from dashboard.levers import render_lever_panel, ScenarioState, PRESET_DEFAULTS
+from dashboard.levers import render_lever_panel, render_sidebar_panel, render_lab_panel, ScenarioState, PRESET_DEFAULTS
 
 # ── Page config ────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -403,7 +403,7 @@ def _sum_historical(hist_dict: dict, regions: list) -> pd.DataFrame:
 
 
 # ── Sidebar lever panel ────────────────────────────────────────────────────
-state, lever_updated = render_lever_panel()
+state, _ = render_sidebar_panel()
 
 # ── Load data ──────────────────────────────────────────────────────────────
 all_projections = load_all_projections()
@@ -415,9 +415,9 @@ vintage = load_vintage()
 sc_id = state.scenario_id
 
 # ── Custom lever recomputation ─────────────────────────────────────────────
-# When Update is clicked, check if lever values differ from the selected preset.
-# If so, recompute a "custom" scenario and overlay it on the active chart.
-# Derive comparison defaults from the canonical PRESET_DEFAULTS in levers.py.
+# Lever recomputation now happens inside the Scenario Lab tab when the user
+# clicks "▶ Apply Scenario". This block keeps the helper functions and reads
+# any existing custom projection from session state.
 # smr_post2040_share is stored as integer percent in levers.py; convert to float fraction here.
 _preset_defaults = {
     k: {**v, "smr_post2040_share": v["smr_post2040_share"] / 100.0}
@@ -440,36 +440,10 @@ def _levers_match_preset(state: ScenarioState, preset_id: str) -> bool:
 
 custom_projection: dict | None = st.session_state.get("_custom_projection")
 
-# Clear custom if user switched presets (even without clicking Update)
+# Clear custom if user switched presets (even without clicking Apply in the Lab)
 if st.session_state.get("_custom_for_scenario") != sc_id:
     st.session_state.pop("_custom_projection", None)
     custom_projection = None
-
-if lever_updated:
-    if _levers_match_preset(state, sc_id):
-        # Levers match preset — use precomputed data, clear any custom
-        st.session_state.pop("_custom_projection", None)
-        custom_projection = None
-    else:
-        # Custom settings — recompute using session-unique scenario ID
-        with st.spinner("Computing custom projection…"):
-            custom_projection = write_and_run_custom_scenario(
-                extension_policy=state.extension_policy_global,
-                pipeline_uc_rate=state.pipeline_uc_rate,
-                pipeline_planned_rate=state.pipeline_planned_rate,
-                pipeline_proposed_rate=state.pipeline_proposed_rate,
-                construction_delay_adder=state.construction_delay_adder,
-                post2040_global_gw=state.post2040_global_growth_gw,
-                smr_uc_rate=state.smr_uc_rate,
-                smr_planned_rate=state.smr_planned_rate,
-                smr_proposed_rate=state.smr_proposed_rate,
-                china_post2040_gw=state.china_post2040_gw,
-                smr_accel_start_year=state.smr_accel_start_year,
-                smr_accel_gw_per_year=state.smr_accel_gw_per_year,
-                scenario_id=_SESSION_CUSTOM_ID,
-            )
-        st.session_state["_custom_projection"] = custom_projection
-        st.session_state["_custom_for_scenario"] = sc_id
 
 # Use custom projection if available, else precomputed
 if custom_projection is not None:
@@ -626,18 +600,18 @@ if _wi_active:
         _parts.append(f"{_n_synthetic} synthetic build batch{'es' if _n_synthetic != 1 else ''}")
     st.warning(
         f"🔬 **What-If mode active** — all charts reflect your scenario "
-        f"({', '.join(_parts)}). Go to the **What-If tab** to edit or clear.",
+        f"({', '.join(_parts)}). Go to the **Scenario Lab** tab to edit or clear.",
         icon=None,
     )
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab_wi = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab_lab = st.tabs([
     "📈 Global Projection",
     "📊 Capacity Breakdown",
     "📉 Retirements",
     "➕ New Additions",
     "🏳️ Country Snapshot",
     "🗺️ World Map",
-    "🔬 What-If",
+    "🔬 Scenario Lab",
 ])
 
 
@@ -1084,202 +1058,66 @@ with tab6:
         )
 
 
-# ── Tab 7: What-If ────────────────────────────────────────────────────────
-with tab_wi:
-    st.subheader("🔬 What-If Scenario Builder")
-    st.caption(
-        "Modify individual reactors — change retirement dates, restart shut-down units, "
-        "or adjust capacity — and instantly see the impact on the global projection. "
-        "Overrides are session-only and never affect the base scenarios."
-    )
+# ── Tab 7: Scenario Lab ────────────────────────────────────────────────────
+with tab_lab:
+    st.subheader("🔬 Scenario Lab")
 
-    # ── Initialise session state ──────────────────────────────────────────
-    if "wi_overrides"  not in st.session_state:
-        st.session_state["wi_overrides"]  = []
-    if "wi_synthetic"  not in st.session_state:
-        st.session_state["wi_synthetic"]  = []
-    if "wi_result"     not in st.session_state:
-        st.session_state["wi_result"]     = None
+    # Build defaults from current preset for the lab form
+    _lab_preset = st.session_state.get("preset_selector", "base")
+    _lab_sc_id  = _lab_preset if _lab_preset != "custom" else "base"
+    _lab_defaults = PRESET_DEFAULTS.get(_lab_sc_id if _lab_sc_id != "custom" else "base",
+                                        PRESET_DEFAULTS["base"])
 
-    # ── Load reactor options (cached) ─────────────────────────────────────
-    @st.cache_data(ttl=300)
-    def _load_reactor_options():
-        return get_reactor_options()
+    lab_submitted = render_lab_panel(_lab_sc_id, _lab_defaults)
 
-    reactor_opts = _load_reactor_options()
-    reactor_opts["label"] = (
-        reactor_opts["name"] + " — " +
-        reactor_opts["country"] + " · " +
-        reactor_opts["status"] + " · " +
-        (reactor_opts["net_capacity_mw"] / 1000).round(2).astype(str) + " GW"
-    )
-    label_to_id = dict(zip(reactor_opts["label"], reactor_opts["reactor_id"]))
-    id_to_row   = reactor_opts.set_index("reactor_id").to_dict("index")
+    if lab_submitted:
+        # Step 1: recompute macro levers if they differ from preset
+        if not _levers_match_preset(state, sc_id):
+            with st.spinner("Computing custom projection…"):
+                custom_projection = write_and_run_custom_scenario(
+                    extension_policy=state.extension_policy_global,
+                    pipeline_uc_rate=state.pipeline_uc_rate,
+                    pipeline_planned_rate=state.pipeline_planned_rate,
+                    pipeline_proposed_rate=state.pipeline_proposed_rate,
+                    construction_delay_adder=state.construction_delay_adder,
+                    post2040_global_gw=state.post2040_global_growth_gw,
+                    smr_uc_rate=state.smr_uc_rate,
+                    smr_planned_rate=state.smr_planned_rate,
+                    smr_proposed_rate=state.smr_proposed_rate,
+                    china_post2040_gw=state.china_post2040_gw,
+                    smr_accel_start_year=state.smr_accel_start_year,
+                    smr_accel_gw_per_year=state.smr_accel_gw_per_year,
+                    scenario_id=_SESSION_CUSTOM_ID,
+                )
+            st.session_state["_custom_projection"] = custom_projection
+            st.session_state["_custom_for_scenario"] = sc_id
+            active_scenario_id = _SESSION_CUSTOM_ID
+        else:
+            # Levers match preset — clear any custom, use precomputed
+            st.session_state.pop("_custom_projection", None)
+            custom_projection = None
+            active_scenario_id = sc_id
 
-    # Fields available depend on reactor status
-    _PIPELINE_STATUSES = {"UnderConstruction", "Planned", "Proposed"}
-    _FLEET_FIELDS    = ["retirement_year", "restart_date", "status", "capacity_mw"]
-    _PIPELINE_FIELDS = ["expected_online_year", "pipeline_probability", "capacity_mw"]
-
-    # ── Override builder form ─────────────────────────────────────────────
-    with st.expander("➕ Add a reactor override", expanded=True):
-        wi_col1, wi_col2, wi_col3 = st.columns([3, 2, 2])
-        with wi_col1:
-            selected_label = st.selectbox(
-                "Reactor", options=[""] + list(label_to_id.keys()),
-                key="wi_reactor_sel", label_visibility="collapsed",
-                placeholder="Search for a reactor…",
-            )
-        # Choose field options based on selected reactor's status
-        _sel_status = (id_to_row[label_to_id[selected_label]]["status"]
-                       if selected_label else None)
-        _field_opts = (_PIPELINE_FIELDS if _sel_status in _PIPELINE_STATUSES
-                       else _FLEET_FIELDS)
-        with wi_col2:
-            override_field = st.selectbox(
-                "Field", options=_field_opts,
-                key="wi_field_sel", label_visibility="collapsed",
-            )
-        _placeholders = {
-            "retirement_year":      "e.g. 2045",
-            "restart_date":         "e.g. 2028-06",
-            "status":               "e.g. Restarted",
-            "capacity_mw":          "e.g. 900",
-            "expected_online_year": "e.g. 2032",
-            "pipeline_probability": "0.0 – 1.0",
-        }
-        with wi_col3:
-            override_value_raw = st.text_input(
-                "Value", key="wi_value_inp", label_visibility="collapsed",
-                placeholder=_placeholders.get(override_field, "value"),
-            )
-
-        if st.button("➕ Add override", type="primary", key="wi_add_btn"):
-            if not selected_label:
-                st.warning("Select a reactor first.")
-            elif not override_value_raw.strip():
-                st.warning("Enter a value.")
-            else:
-                rid = label_to_id[selected_label]
-                try:
-                    if override_field in ("retirement_year", "expected_online_year"):
-                        val = int(override_value_raw.strip())
-                    elif override_field in ("capacity_mw", "pipeline_probability"):
-                        val = float(override_value_raw.strip())
-                    else:
-                        val = override_value_raw.strip()
-                    existing = st.session_state["wi_overrides"]
-                    existing = [o for o in existing
-                                if not (o["reactor_id"] == rid and o["field"] == override_field)]
-                    existing.append({
-                        "reactor_id":   rid,
-                        "reactor_name": id_to_row[rid]["name"],
-                        "country":      id_to_row[rid]["country"],
-                        "field":        override_field,
-                        "value":        val,
-                    })
-                    st.session_state["wi_overrides"] = existing
-                    st.session_state["wi_result"] = None
-                    st.rerun()
-                except ValueError:
-                    st.error(f"Invalid value for {override_field}: '{override_value_raw}'")
-
-    # ── Synthetic new-build batch form ────────────────────────────────────
-    with st.expander("🏗 Add a synthetic new-build batch", expanded=False):
-        st.caption("Model hypothetical reactors not in the database — e.g. 'what if the US built 3 × 300 MW reactors per year starting 2033?'")
-        sb_c1, sb_c2, sb_c3, sb_c4, sb_c5 = st.columns([2, 1, 1, 1, 1])
-        with sb_c1:
-            sb_region = st.selectbox("Region", options=REGIONS, key="wi_sb_region",
-                                     label_visibility="collapsed")
-        with sb_c2:
-            sb_cap = st.number_input("MW each", min_value=10, max_value=10000,
-                                     value=300, step=50, key="wi_sb_cap",
-                                     label_visibility="collapsed")
-        with sb_c3:
-            sb_per_yr = st.number_input("Per year", min_value=1, max_value=50,
-                                        value=3, step=1, key="wi_sb_per_yr",
-                                        label_visibility="collapsed")
-        with sb_c4:
-            sb_start = st.number_input("Start year", min_value=2025, max_value=2049,
-                                       value=2030, step=1, key="wi_sb_start",
-                                       label_visibility="collapsed")
-        with sb_c5:
-            sb_nyrs = st.number_input("For N years", min_value=1, max_value=20,
-                                      value=5, step=1, key="wi_sb_nyrs",
-                                      label_visibility="collapsed")
-        st.caption(f"Region · MW each · Per year · Start year · For N years  →  adds **{int(sb_per_yr) * int(sb_cap) / 1000:.1f} GW/yr** in **{sb_region}** for {int(sb_nyrs)} year(s) from {int(sb_start)}")
-        if st.button("➕ Add batch", key="wi_sb_add", type="primary"):
-            label = f"{int(sb_per_yr)} × {int(sb_cap)} MW/yr in {sb_region} from {int(sb_start)} ({int(sb_nyrs)} yr)"
-            st.session_state["wi_synthetic"].append({
-                "label":      label,
-                "region":     sb_region,
-                "capacity_mw": float(sb_cap),
-                "per_year":   int(sb_per_yr),
-                "start_year": int(sb_start),
-                "n_years":    int(sb_nyrs),
-            })
-            st.session_state["wi_result"] = None
-            st.rerun()
-
-    # ── Current overrides + synthetic table ──────────────────────────────
-    overrides  = st.session_state["wi_overrides"]
-    synthetic  = st.session_state["wi_synthetic"]
-    has_any    = overrides or synthetic
-
-    if has_any:
-        if overrides:
-            st.markdown("**Reactor overrides**")
-            for i, ov in enumerate(overrides):
-                c1, c2, c3, c4 = st.columns([3, 2, 2, 1])
-                c1.write(f"**{ov['reactor_name']}** ({ov['country']})")
-                c2.write(ov["field"].replace("_", " ").title())
-                c3.write(str(ov["value"]))
-                if c4.button("✕", key=f"wi_rm_{i}"):
-                    st.session_state["wi_overrides"].pop(i)
-                    st.session_state["wi_result"] = None
-                    st.rerun()
-
-        if synthetic:
-            st.markdown("**Synthetic new builds**")
-            for i, sb in enumerate(synthetic):
-                sc1, sc2 = st.columns([6, 1])
-                sc1.write(sb["label"])
-                if sc2.button("✕", key=f"wi_sb_rm_{i}"):
-                    st.session_state["wi_synthetic"].pop(i)
-                    st.session_state["wi_result"] = None
-                    st.rerun()
-
-        st.markdown("")
-        run_col, clear_col = st.columns([2, 1])
-        with run_col:
-            run_wi = st.button("▶ Run What-If", type="primary", key="wi_run_btn",
-                               use_container_width=True)
-        with clear_col:
-            if st.button("🗑 Clear all", key="wi_clear_btn", use_container_width=True):
-                st.session_state["wi_overrides"] = []
-                st.session_state["wi_synthetic"] = []
-                st.session_state["wi_result"]    = None
-                st.session_state["wi_proj_all"]  = None
-                st.rerun()
-
-        if run_wi:
-            wi_dict = _build_wi_overrides_dict()
+        # Step 2: run what-if overrides on top
+        wi_dict = _build_wi_overrides_dict()
+        if wi_dict:
             with st.spinner("Running what-if projection across all regions…"):
                 try:
                     wi_all = run_what_if_all_regions(
-                        scenario_id=_active_db_id,
+                        scenario_id=active_scenario_id,
                         what_if_overrides=wi_dict,
                     )
                     st.session_state["wi_proj_all"] = wi_all
                     st.session_state["wi_result"]   = wi_all.get("Global")
-                    st.rerun()
                 except Exception as e:
                     st.error(f"Projection failed: {e}")
+        else:
+            st.session_state["wi_proj_all"] = None
+            st.session_state["wi_result"]   = None
 
-    else:
-        st.info("No overrides yet — add a reactor override or a synthetic new-build batch above.")
+        st.rerun()
 
-    # ── Results ───────────────────────────────────────────────────────────
+    # ── Diff chart shown after results exist ──────────────────────────────
     if st.session_state.get("wi_result") is not None:
         wi_proj   = st.session_state["wi_result"]
         base_proj = proj_global_display[["year", "capacity_operating_gw",
@@ -1290,7 +1128,7 @@ with tab_wi:
             base_df=base_proj,
             whatif_df=wi_proj,
             base_label=f"{active_key.title()} (base)",
-            whatif_label="What-If",
+            whatif_label="Scenario Lab",
         )
         st.plotly_chart(fig_wi, use_container_width=True)
 

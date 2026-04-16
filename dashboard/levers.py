@@ -1,17 +1,11 @@
 """
 levers.py — Scenario lever UI components for the nuclear capacity dashboard.
 
-Simplified panel with:
-  - Scenario preset selector
-  - Life Extensions (global policy only)
-  - Pipeline Realization: separate Large Reactor + SMR toggles (High/Medium/Low)
-  - Construction delay adder: discrete steps 0/1/2/3/5 years
-  - Post-2040 New Build: global rate + China carve-out
-  - Display Options
-  - Scenario Comparison
-  - Geography Filter (checkbox list)
+Provides two panel renderers:
+  - render_sidebar_panel(): minimal sidebar (preset, geo, display opts, save/load)
+  - render_lab_panel(): full macro levers + what-if builder inside Scenario Lab tab
 
-An "Update" button (via st.form) gates all recalculations.
+An older render_lever_panel() alias is kept for backward compatibility.
 """
 import streamlit as st
 from dataclasses import dataclass, field
@@ -277,17 +271,67 @@ def apply_loaded_scenario(payload: dict) -> None:
         st.session_state[f"geo_{region}"] = bool(checked)
 
 
-# ── Main lever panel renderer ──────────────────────────────────────────────
+# ── Helper: build ScenarioState from session state ─────────────────────────
 
-def render_lever_panel() -> tuple[ScenarioState, bool]:
+def _build_state_from_session(preset: str, defaults: dict, scenario_id: str,
+                               selected_regions: list) -> ScenarioState:
+    """Read current lever values from session state and build a ScenarioState."""
+    lp_data = LARGE_PIPELINE_PRESETS[defaults["large_pipeline_preset"]]
+    sp_data = SMR_PIPELINE_PRESETS[defaults["smr_pipeline_preset"]]
+
+    delay_val = st.session_state.get("lv_delay", defaults["construction_delay_adder"])
+    if delay_val not in DELAY_OPTIONS:
+        delay_val = min(DELAY_OPTIONS, key=lambda x: abs(x - delay_val))
+
+    smr_share_final = int(st.session_state.get("lv_smr_share_pct", defaults["smr_post2040_share"]))
+
+    final_large_uc   = st.session_state.get("lv_large_uc_pct",   int(lp_data["uc_rate"]       * 100)) / 100.0
+    final_large_plan = st.session_state.get("lv_large_plan_pct", int(lp_data["planned_rate"]  * 100)) / 100.0
+    final_large_prop = st.session_state.get("lv_large_prop_pct", int(lp_data["proposed_rate"] * 100)) / 100.0
+    final_smr_uc     = st.session_state.get("lv_smr_uc_pct",     int(sp_data["uc_rate"]       * 100)) / 100.0
+    final_smr_plan   = st.session_state.get("lv_smr_plan_pct",   int(sp_data["planned_rate"]  * 100)) / 100.0
+    final_smr_prop   = st.session_state.get("lv_smr_prop_pct",   int(sp_data["proposed_rate"] * 100)) / 100.0
+
+    return ScenarioState(
+        scenario_id=scenario_id,
+        name=preset.title(),
+        extension_policy_global=st.session_state.get("lv_ext_policy", defaults["extension_policy_global"]),
+        large_pipeline_preset=defaults["large_pipeline_preset"],
+        pipeline_uc_rate=final_large_uc,
+        pipeline_planned_rate=final_large_plan,
+        pipeline_proposed_rate=final_large_prop,
+        smr_pipeline_preset=defaults["smr_pipeline_preset"],
+        smr_uc_rate=final_smr_uc,
+        smr_planned_rate=final_smr_plan,
+        smr_proposed_rate=final_smr_prop,
+        construction_delay_adder=float(delay_val),
+        smr_accel_start_year=int(st.session_state.get("lv_smr_accel_start", defaults["smr_accel_start_year"])),
+        smr_accel_gw_per_year=float(st.session_state.get("lv_smr_accel_rate", defaults["smr_accel_gw_per_year"])),
+        smr_post2040_share=smr_share_final / 100.0,
+        post2040_global_growth_gw=st.session_state.get("lv_post2040_gw", defaults["post2040_global_growth_gw"]),
+        china_post2040_gw=st.session_state.get("lv_china_gw", defaults["china_post2040_gw"]),
+        show_iaea_low=st.session_state.get("lv_iaea_low", True),
+        show_iaea_high=st.session_state.get("lv_iaea_high", True),
+        show_iea_steps=st.session_state.get("lv_iea_steps", True),
+        show_iea_aps=st.session_state.get("lv_iea_aps", False),
+        show_iea_low_nuclear=st.session_state.get("lv_iea_low_nuc", True),
+        show_historical=st.session_state.get("lv_show_hist", True),
+        show_transition_marker=st.session_state.get("lv_show_trans", True),
+        compare_scenarios=st.session_state.get("lv_compare", []),
+        selected_regions=selected_regions,
+    )
+
+
+# ── Sidebar panel ──────────────────────────────────────────────────────────
+
+def render_sidebar_panel() -> tuple:
     """
-    Render the full lever panel in the Streamlit sidebar.
-    All lever widgets are inside a st.form; changes only apply when
-    the user clicks "Update Projections".
-    Returns (ScenarioState, lever_updated) where lever_updated=True
-    means the form was just submitted.
+    Render the minimal sidebar panel.
+    Contains: title, preset selector, Scenario Lab status line,
+    geography filter, display options, scenario comparison, save/load.
+    Returns (ScenarioState, False) — no submitted flag from the sidebar.
     """
-    st.sidebar.title("Scenario Levers")
+    st.sidebar.title("⚛️ Nuclear Capacity Dashboard")
     st.sidebar.markdown("---")
 
     # ── Preset selector (outside form — changes defaults but doesn't re-project) ──
@@ -305,7 +349,7 @@ def render_lever_panel() -> tuple[ScenarioState, bool]:
         format_func=lambda x: preset_labels[x],
         index=2,  # default: base
         key="preset_selector",
-        help="Loading a preset fills the levers below. Click 'Update' to apply.",
+        help="Loading a preset fills the levers in the Scenario Lab tab. Click '▶ Apply Scenario' to apply.",
     )
 
     # When preset changes, push defaults into session state so form widgets pick them up
@@ -334,12 +378,330 @@ def render_lever_panel() -> tuple[ScenarioState, bool]:
     defaults = PRESET_DEFAULTS.get(preset if preset != "custom" else "base", PRESET_DEFAULTS["base"])
     scenario_id = preset if preset != "custom" else "base"
 
-    # ── Lever form ─────────────────────────────────────────────────────────
-    with st.sidebar.form("lever_form", clear_on_submit=False):
+    # ── Scenario Lab status line ───────────────────────────────────────────
+    _wi_proj_all = st.session_state.get("wi_proj_all")
+    _wi_overrides = st.session_state.get("wi_overrides", [])
+    _wi_synthetic = st.session_state.get("wi_synthetic", [])
+    if _wi_proj_all is not None and (_wi_overrides or _wi_synthetic):
+        n = len(_wi_overrides)
+        m = len(_wi_synthetic)
+        st.sidebar.info(f"🔬 Scenario Lab active — {n} override(s) + {m} batch(es)")
+
+    # ── Geography Filter ───────────────────────────────────────────────────
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🌍 Geography Filter")
+    with st.sidebar.expander("Select regions to display", expanded=False):
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("All", key="geo_all"):
+                for r in REGIONS:
+                    st.session_state[f"geo_{r}"] = True
+        with col_b:
+            if st.button("None", key="geo_none"):
+                for r in REGIONS:
+                    st.session_state[f"geo_{r}"] = False
+
+        selected_regions = []
+        for region in REGIONS:
+            checked = st.checkbox(
+                region,
+                value=st.session_state.get(f"geo_{region}", True),
+                key=f"geo_{region}",
+            )
+            if checked:
+                selected_regions.append(region)
+
+    if not selected_regions:
+        selected_regions = list(REGIONS)  # safety fallback
+
+    # ── Display Options ────────────────────────────────────────────────────
+    st.sidebar.markdown("---")
+    with st.sidebar.expander("🎨 Display Options", expanded=False):
+        st.toggle("Show historical data (2005–2024)", value=True, key="lv_show_hist")
+        st.toggle("Show transition year marker", value=True, key="lv_show_trans")
+        st.markdown("**Benchmark overlays**")
+        st.toggle("IAEA Low Case (561 GW)",      value=True,  key="lv_iaea_low")
+        st.toggle("IAEA High Case (992 GW)",     value=True,  key="lv_iaea_high")
+        st.toggle("IEA STEPS (647 GW)",          value=True,  key="lv_iea_steps")
+        st.toggle("IEA APS (874 GW)",            value=False, key="lv_iea_aps")
+        st.toggle("IEA Low Nuclear (~250 GW)",   value=True,  key="lv_iea_low_nuc")
+
+    # ── Scenario Comparison ────────────────────────────────────────────────
+    st.sidebar.markdown("---")
+    all_scenarios = ["decline", "conservative", "base", "optimistic"]
+    compare_opts = [s for s in all_scenarios if s != scenario_id]
+    compare_labels = {
+        "decline": "Decline", "conservative": "Conservative",
+        "base": "Base", "optimistic": "Optimistic",
+    }
+    st.sidebar.multiselect(
+        "Compare with scenarios",
+        options=compare_opts,
+        format_func=lambda x: compare_labels[x],
+        default=[],
+        key="lv_compare",
+        help="Overlay additional scenario lines on the global projection chart.",
+    )
+
+    # ── Save / Load scenario ───────────────────────────────────────────────
+    # Build a temporary state to serialize for save
+    state = _build_state_from_session(preset, defaults, scenario_id, selected_regions)
+
+    st.sidebar.markdown("---")
+    with st.sidebar.expander("💾 Save / Load Scenario", expanded=False):
+        # Save
+        safe_name = state.name.lower().replace(" ", "_")
+        filename = f"nuclear_scenario_{safe_name}_{date.today()}.json"
+        st.download_button(
+            label="⬇ Download current scenario (.json)",
+            data=build_save_payload(state),
+            file_name=filename,
+            mime="application/json",
+            use_container_width=True,
+            help="Downloads all lever positions as a JSON file you can reload later.",
+        )
+
+        st.caption(
+            "The downloaded file captures every lever position — extension policy, "
+            "pipeline rates, delay adder, post-2040 growth, SMR settings, display "
+            "toggles, and geography filter."
+        )
+
+        st.markdown("**Load a saved scenario**")
+        uploaded = st.file_uploader(
+            "Upload a scenario JSON file",
+            type=["json"],
+            key="scenario_upload",
+            label_visibility="collapsed",
+        )
+        if uploaded is not None:
+            try:
+                payload = json.loads(uploaded.read())
+                if payload.get("version") != 1:
+                    st.error("Unrecognised file format (version mismatch).")
+                else:
+                    apply_loaded_scenario(payload)
+                    loaded_name = payload.get("scenario_name", "saved scenario")
+                    saved_at = payload.get("saved_at", "unknown date")
+                    st.success(
+                        f"Loaded **{loaded_name}** (saved {saved_at}). "
+                        "Go to **Scenario Lab** and click **▶ Apply Scenario** to apply."
+                    )
+                    st.rerun()
+            except (json.JSONDecodeError, KeyError) as e:
+                st.error(f"Could not parse scenario file: {e}")
+
+    return state, False
+
+
+# ── Scenario Lab panel (renders inside the Scenario Lab tab) ───────────────
+
+def render_lab_panel(scenario_id: str, defaults: dict) -> bool:
+    """
+    Render the full macro lever panel + what-if builder inside the Scenario Lab tab.
+    Override builder / synthetic builds / remove buttons are OUTSIDE the form
+    (they call st.rerun). The macro levers are inside st.form("lab_form").
+    Returns submitted (bool) — True when the form submit button was clicked.
+    """
+    st.caption(
+        "Adjust macro scenario levers and/or add per-reactor overrides, then click "
+        "**▶ Apply Scenario** to recompute projections across all regions."
+    )
+
+    # ── Initialise session state ──────────────────────────────────────────
+    if "wi_overrides" not in st.session_state:
+        st.session_state["wi_overrides"] = []
+    if "wi_synthetic" not in st.session_state:
+        st.session_state["wi_synthetic"] = []
+    if "wi_result" not in st.session_state:
+        st.session_state["wi_result"] = None
+
+    # ── Load reactor options (cached via app.py — reuse if already loaded) ──
+    # We import lazily to avoid circular imports; the cache is app-level anyway.
+    try:
+        from model.api import get_reactor_options
+        import streamlit as _st
+
+        @_st.cache_data(ttl=300)
+        def _load_reactor_options_lab():
+            return get_reactor_options()
+
+        reactor_opts = _load_reactor_options_lab()
+        reactor_opts["label"] = (
+            reactor_opts["name"] + " — " +
+            reactor_opts["country"] + " · " +
+            reactor_opts["status"] + " · " +
+            (reactor_opts["net_capacity_mw"] / 1000).round(2).astype(str) + " GW"
+        )
+        label_to_id = dict(zip(reactor_opts["label"], reactor_opts["reactor_id"]))
+        id_to_row   = reactor_opts.set_index("reactor_id").to_dict("index")
+        _reactor_opts_ok = True
+    except Exception:
+        _reactor_opts_ok = False
+        label_to_id = {}
+        id_to_row = {}
+
+    _PIPELINE_STATUSES = {"UnderConstruction", "Planned", "Proposed"}
+    _FLEET_FIELDS    = ["retirement_year", "restart_date", "status", "capacity_mw"]
+    _PIPELINE_FIELDS = ["expected_online_year", "pipeline_probability", "capacity_mw"]
+
+    # ── 1. Override builder expander (OUTSIDE form) ───────────────────────
+    with st.expander("➕ Add a reactor override", expanded=True):
+        if not _reactor_opts_ok:
+            st.warning("Reactor options could not be loaded.")
+        else:
+            wi_col1, wi_col2, wi_col3 = st.columns([3, 2, 2])
+            with wi_col1:
+                selected_label = st.selectbox(
+                    "Reactor", options=[""] + list(label_to_id.keys()),
+                    key="wi_reactor_sel", label_visibility="collapsed",
+                    placeholder="Search for a reactor…",
+                )
+            _sel_status = (id_to_row[label_to_id[selected_label]]["status"]
+                           if selected_label else None)
+            _field_opts = (_PIPELINE_FIELDS if _sel_status in _PIPELINE_STATUSES
+                           else _FLEET_FIELDS)
+            with wi_col2:
+                override_field = st.selectbox(
+                    "Field", options=_field_opts,
+                    key="wi_field_sel", label_visibility="collapsed",
+                )
+            _placeholders = {
+                "retirement_year":      "e.g. 2045",
+                "restart_date":         "e.g. 2028-06",
+                "status":               "e.g. Restarted",
+                "capacity_mw":          "e.g. 900",
+                "expected_online_year": "e.g. 2032",
+                "pipeline_probability": "0.0 – 1.0",
+            }
+            with wi_col3:
+                override_value_raw = st.text_input(
+                    "Value", key="wi_value_inp", label_visibility="collapsed",
+                    placeholder=_placeholders.get(override_field, "value"),
+                )
+
+            if st.button("➕ Add override", type="primary", key="wi_add_btn"):
+                if not selected_label:
+                    st.warning("Select a reactor first.")
+                elif not override_value_raw.strip():
+                    st.warning("Enter a value.")
+                else:
+                    rid = label_to_id[selected_label]
+                    try:
+                        if override_field in ("retirement_year", "expected_online_year"):
+                            val = int(override_value_raw.strip())
+                        elif override_field in ("capacity_mw", "pipeline_probability"):
+                            val = float(override_value_raw.strip())
+                        else:
+                            val = override_value_raw.strip()
+                        existing = st.session_state["wi_overrides"]
+                        existing = [o for o in existing
+                                    if not (o["reactor_id"] == rid and o["field"] == override_field)]
+                        existing.append({
+                            "reactor_id":   rid,
+                            "reactor_name": id_to_row[rid]["name"],
+                            "country":      id_to_row[rid]["country"],
+                            "field":        override_field,
+                            "value":        val,
+                        })
+                        st.session_state["wi_overrides"] = existing
+                        st.session_state["wi_result"] = None
+                        st.rerun()
+                    except ValueError:
+                        st.error(f"Invalid value for {override_field}: '{override_value_raw}'")
+
+    # ── 2. Synthetic builds expander (OUTSIDE form) ───────────────────────
+    with st.expander("🏗 Add a synthetic new-build batch", expanded=False):
+        st.caption("Model hypothetical reactors not in the database — e.g. 'what if the US built 3 × 300 MW reactors per year starting 2033?'")
+        sb_c1, sb_c2, sb_c3, sb_c4, sb_c5 = st.columns([2, 1, 1, 1, 1])
+        with sb_c1:
+            sb_region = st.selectbox("Region", options=REGIONS, key="wi_sb_region",
+                                     label_visibility="collapsed")
+        with sb_c2:
+            sb_cap = st.number_input("MW each", min_value=10, max_value=10000,
+                                     value=300, step=50, key="wi_sb_cap",
+                                     label_visibility="collapsed")
+        with sb_c3:
+            sb_per_yr = st.number_input("Per year", min_value=1, max_value=50,
+                                        value=3, step=1, key="wi_sb_per_yr",
+                                        label_visibility="collapsed")
+        with sb_c4:
+            sb_start = st.number_input("Start year", min_value=2025, max_value=2049,
+                                       value=2030, step=1, key="wi_sb_start",
+                                       label_visibility="collapsed")
+        with sb_c5:
+            sb_nyrs = st.number_input("For N years", min_value=1, max_value=20,
+                                      value=5, step=1, key="wi_sb_nyrs",
+                                      label_visibility="collapsed")
+        st.caption(
+            f"Region · MW each · Per year · Start year · For N years  →  adds "
+            f"**{int(sb_per_yr) * int(sb_cap) / 1000:.1f} GW/yr** in **{sb_region}** "
+            f"for {int(sb_nyrs)} year(s) from {int(sb_start)}"
+        )
+        if st.button("➕ Add batch", key="wi_sb_add", type="primary"):
+            label = f"{int(sb_per_yr)} × {int(sb_cap)} MW/yr in {sb_region} from {int(sb_start)} ({int(sb_nyrs)} yr)"
+            st.session_state["wi_synthetic"].append({
+                "label":      label,
+                "region":     sb_region,
+                "capacity_mw": float(sb_cap),
+                "per_year":   int(sb_per_yr),
+                "start_year": int(sb_start),
+                "n_years":    int(sb_nyrs),
+            })
+            st.session_state["wi_result"] = None
+            st.rerun()
+
+    # ── 3. Current overrides/batches display with remove buttons (OUTSIDE form) ──
+    overrides = st.session_state["wi_overrides"]
+    synthetic = st.session_state["wi_synthetic"]
+    has_any   = overrides or synthetic
+
+    if has_any:
+        if overrides:
+            st.markdown("**Reactor overrides**")
+            for i, ov in enumerate(overrides):
+                c1, c2, c3, c4 = st.columns([3, 2, 2, 1])
+                c1.write(f"**{ov['reactor_name']}** ({ov['country']})")
+                c2.write(ov["field"].replace("_", " ").title())
+                c3.write(str(ov["value"]))
+                if c4.button("✕", key=f"wi_rm_{i}"):
+                    st.session_state["wi_overrides"].pop(i)
+                    st.session_state["wi_result"] = None
+                    st.rerun()
+
+        if synthetic:
+            st.markdown("**Synthetic new builds**")
+            for i, sb in enumerate(synthetic):
+                sc1, sc2 = st.columns([6, 1])
+                sc1.write(sb["label"])
+                if sc2.button("✕", key=f"wi_sb_rm_{i}"):
+                    st.session_state["wi_synthetic"].pop(i)
+                    st.session_state["wi_result"] = None
+                    st.rerun()
+
+        st.markdown("")
+        if st.button("🗑 Clear all overrides & batches", key="wi_clear_btn",
+                     use_container_width=False):
+            st.session_state["wi_overrides"] = []
+            st.session_state["wi_synthetic"] = []
+            st.session_state["wi_result"]    = None
+            st.session_state["wi_proj_all"]  = None
+            st.rerun()
+
+    st.markdown("---")
+
+    # ── 4. Macro lever form ────────────────────────────────────────────────
+    with st.form("lab_form", clear_on_submit=False):
+
+        # Read-only override summary at top of form
+        n_ov = len(st.session_state.get("wi_overrides", []))
+        n_sb = len(st.session_state.get("wi_synthetic", []))
+        if n_ov or n_sb:
+            st.info(f"🔬 {n_ov} reactor override(s) + {n_sb} synthetic batch(es) queued — will be applied on submit.")
 
         # ── Group 1: Life Extensions ───────────────────────────────────────
         st.markdown("### ⏳ Life Extensions")
-        ext_policy = st.selectbox(
+        st.selectbox(
             "Extension policy (global)",
             options=EXTENSION_POLICIES,
             format_func=_ext_label,
@@ -358,59 +720,53 @@ def render_lever_panel() -> tuple[ScenarioState, bool]:
         # ── Group 2: Pipeline Realization ─────────────────────────────────
         st.markdown("### 🔩 Pipeline Realization")
 
-        # Derive preset defaults from current scenario
         lpp = LARGE_PIPELINE_PRESETS[defaults["large_pipeline_preset"]]
 
         st.caption("**Large Reactors** — realization rate per pipeline stage:")
 
-        # Per-stage rate inputs (editable — preset fills defaults; can be overridden)
         _luc_def  = int(st.session_state.get("lv_large_uc_pct",   int(lpp["uc_rate"]      * 100)))
         _lpl_def  = int(st.session_state.get("lv_large_plan_pct", int(lpp["planned_rate"] * 100)))
         _lpr_def  = int(st.session_state.get("lv_large_prop_pct", int(lpp["proposed_rate"]* 100)))
         _lc1, _lc2, _lc3 = st.columns(3)
         with _lc1:
-            large_uc_pct  = st.number_input("UC %",       min_value=0, max_value=100, step=5,
-                                             value=_luc_def, key="lv_large_uc_pct",
-                                             help="Under Construction realization rate")
+            st.number_input("UC %",       min_value=0, max_value=100, step=5,
+                            value=_luc_def, key="lv_large_uc_pct",
+                            help="Under Construction realization rate")
         with _lc2:
-            large_plan_pct = st.number_input("Planned %", min_value=0, max_value=100, step=5,
-                                             value=_lpl_def, key="lv_large_plan_pct",
-                                             help="Planned realization rate")
+            st.number_input("Planned %", min_value=0, max_value=100, step=5,
+                            value=_lpl_def, key="lv_large_plan_pct",
+                            help="Planned realization rate")
         with _lc3:
-            large_prop_pct = st.number_input("Proposed %",min_value=0, max_value=100, step=5,
-                                             value=_lpr_def, key="lv_large_prop_pct",
-                                             help="Proposed realization rate")
+            st.number_input("Proposed %", min_value=0, max_value=100, step=5,
+                            value=_lpr_def, key="lv_large_prop_pct",
+                            help="Proposed realization rate")
 
         st.markdown(" ")
 
-        # Derive SMR preset defaults from current scenario
         spp = SMR_PIPELINE_PRESETS[defaults["smr_pipeline_preset"]]
 
         st.caption("**SMR Pipeline** — realization rate per pipeline stage:")
 
-        # Per-stage rate inputs — SMR
         _suc_def  = int(st.session_state.get("lv_smr_uc_pct",   int(spp["uc_rate"]      * 100)))
         _spl_def  = int(st.session_state.get("lv_smr_plan_pct", int(spp["planned_rate"] * 100)))
         _spr_def  = int(st.session_state.get("lv_smr_prop_pct", int(spp["proposed_rate"]* 100)))
         _sc1, _sc2, _sc3 = st.columns(3)
         with _sc1:
-            smr_uc_pct   = st.number_input("UC %",       min_value=0, max_value=100, step=5,
-                                            value=_suc_def, key="lv_smr_uc_pct",
-                                            help="SMR Under Construction realization rate")
+            st.number_input("UC %",       min_value=0, max_value=100, step=5,
+                            value=_suc_def, key="lv_smr_uc_pct",
+                            help="SMR Under Construction realization rate")
         with _sc2:
-            smr_plan_pct = st.number_input("Planned %",  min_value=0, max_value=100, step=5,
-                                            value=_spl_def, key="lv_smr_plan_pct",
-                                            help="SMR Planned realization rate")
+            st.number_input("Planned %",  min_value=0, max_value=100, step=5,
+                            value=_spl_def, key="lv_smr_plan_pct",
+                            help="SMR Planned realization rate")
         with _sc3:
-            smr_prop_pct = st.number_input("Proposed %", min_value=0, max_value=100, step=5,
-                                            value=_spr_def, key="lv_smr_prop_pct",
-                                            help="SMR Proposed realization rate")
+            st.number_input("Proposed %", min_value=0, max_value=100, step=5,
+                            value=_spr_def, key="lv_smr_prop_pct",
+                            help="SMR Proposed realization rate")
 
         st.markdown(" ")
 
-        # Construction delay (discrete steps)
         delay_default = st.session_state.get("lv_delay", defaults["construction_delay_adder"])
-        # Snap to nearest valid option
         if delay_default not in DELAY_OPTIONS:
             delay_default = min(DELAY_OPTIONS, key=lambda x: abs(x - delay_default))
 
@@ -430,7 +786,6 @@ def render_lever_panel() -> tuple[ScenarioState, bool]:
         # ── Group 3: SMR Deployment ────────────────────────────────────────
         st.markdown("### 🔬 SMR Deployment")
 
-        # Pre-2040 acceleration
         st.caption("**Pre-2040 acceleration** (beyond announced pipeline)")
         accel_start_default = st.session_state.get("lv_smr_accel_start",
                                                     defaults["smr_accel_start_year"])
@@ -464,7 +819,6 @@ def render_lever_panel() -> tuple[ScenarioState, bool]:
 
         st.markdown(" ")
 
-        # Post-2040 SMR share
         st.caption("**Post-2040 SMR share of new build**")
         smr_share_default = int(st.session_state.get("lv_smr_share_pct",
                                                       defaults["smr_post2040_share"]))
@@ -476,7 +830,6 @@ def render_lever_panel() -> tuple[ScenarioState, bool]:
             label_visibility="collapsed",
         )
         smr_post2040_share_val = smr_share_pct / 100.0
-        # Read current post2040 GW from session for the live breakdown label
         _p40_gw = float(st.session_state.get("lv_post2040_gw",
                                               defaults["post2040_global_growth_gw"]))
         _smr_gw   = _p40_gw * smr_post2040_share_val
@@ -521,159 +874,18 @@ def render_lever_panel() -> tuple[ScenarioState, bool]:
 
         st.markdown("---")
 
-        # ── Group 4: Display Options ───────────────────────────────────────
-        with st.expander("🎨 Display Options", expanded=False):
-            show_historical = st.toggle("Show historical data (2005–2024)", value=True, key="lv_show_hist")
-            show_transition = st.toggle("Show transition year marker", value=True, key="lv_show_trans")
-            st.markdown("**Benchmark overlays**")
-            show_iaea_low  = st.toggle("IAEA Low Case (561 GW)",      value=True,  key="lv_iaea_low")
-            show_iaea_high = st.toggle("IAEA High Case (992 GW)",     value=True,  key="lv_iaea_high")
-            show_iea_steps = st.toggle("IEA STEPS (647 GW)",          value=True,  key="lv_iea_steps")
-            show_iea_aps   = st.toggle("IEA APS (874 GW)",            value=False, key="lv_iea_aps")
-            show_iea_low_nuc = st.toggle("IEA Low Nuclear (~250 GW)", value=True,  key="lv_iea_low_nuc")
-
-        st.markdown("---")
-
-        # ── Group 5: Scenario Comparison ──────────────────────────────────
-        all_scenarios = ["decline", "conservative", "base", "optimistic"]
-        compare_opts = [s for s in all_scenarios if s != scenario_id]
-        compare_labels = {
-            "decline": "Decline", "conservative": "Conservative",
-            "base": "Base", "optimistic": "Optimistic",
-        }
-        compare = st.multiselect(
-            "Compare with scenarios",
-            options=compare_opts,
-            format_func=lambda x: compare_labels[x],
-            default=[],
-            key="lv_compare",
-            help="Overlay additional scenario lines on the global projection chart.",
-        )
-
-        # ── Update button ──────────────────────────────────────────────────
+        # ── Apply Scenario button ──────────────────────────────────────────
         submitted = st.form_submit_button(
-            "▶ Update Projections",
+            "▶ Apply Scenario",
             use_container_width=True,
             type="primary",
         )
 
-    # ── Geography Filter (outside form — immediate filter, no re-project needed) ──
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### 🌍 Geography Filter")
-    with st.sidebar.expander("Select regions to display", expanded=False):
-        col_a, col_b = st.columns(2)
-        with col_a:
-            if st.button("All", key="geo_all"):
-                for r in REGIONS:
-                    st.session_state[f"geo_{r}"] = True
-        with col_b:
-            if st.button("None", key="geo_none"):
-                for r in REGIONS:
-                    st.session_state[f"geo_{r}"] = False
+    return submitted
 
-        selected_regions = []
-        for region in REGIONS:
-            checked = st.checkbox(
-                region,
-                value=st.session_state.get(f"geo_{region}", True),
-                key=f"geo_{region}",
-            )
-            if checked:
-                selected_regions.append(region)
 
-    if not selected_regions:
-        selected_regions = list(REGIONS)  # safety fallback
+# ── Backward-compatible alias ──────────────────────────────────────────────
 
-    # ── Read final lever values from session state ─────────────────────────
-    lp_data = LARGE_PIPELINE_PRESETS[defaults["large_pipeline_preset"]]
-    sp_data = SMR_PIPELINE_PRESETS[defaults["smr_pipeline_preset"]]
-
-    delay_val = st.session_state.get("lv_delay", defaults["construction_delay_adder"])
-    if delay_val not in DELAY_OPTIONS:
-        delay_val = min(DELAY_OPTIONS, key=lambda x: abs(x - delay_val))
-
-    smr_share_final = int(st.session_state.get("lv_smr_share_pct", defaults["smr_post2040_share"]))
-
-    # Per-stage rates: read from editable inputs (fall back to preset if not yet set)
-    final_large_uc   = st.session_state.get("lv_large_uc_pct",   int(lp_data["uc_rate"]       * 100)) / 100.0
-    final_large_plan = st.session_state.get("lv_large_plan_pct", int(lp_data["planned_rate"]  * 100)) / 100.0
-    final_large_prop = st.session_state.get("lv_large_prop_pct", int(lp_data["proposed_rate"] * 100)) / 100.0
-    final_smr_uc     = st.session_state.get("lv_smr_uc_pct",     int(sp_data["uc_rate"]       * 100)) / 100.0
-    final_smr_plan   = st.session_state.get("lv_smr_plan_pct",   int(sp_data["planned_rate"]  * 100)) / 100.0
-    final_smr_prop   = st.session_state.get("lv_smr_prop_pct",   int(sp_data["proposed_rate"] * 100)) / 100.0
-
-    state = ScenarioState(
-        scenario_id=scenario_id,
-        name=preset.title(),
-        extension_policy_global=st.session_state.get("lv_ext_policy", defaults["extension_policy_global"]),
-        large_pipeline_preset=defaults["large_pipeline_preset"],
-        pipeline_uc_rate=final_large_uc,
-        pipeline_planned_rate=final_large_plan,
-        pipeline_proposed_rate=final_large_prop,
-        smr_pipeline_preset=defaults["smr_pipeline_preset"],
-        smr_uc_rate=final_smr_uc,
-        smr_planned_rate=final_smr_plan,
-        smr_proposed_rate=final_smr_prop,
-        construction_delay_adder=float(delay_val),
-        smr_accel_start_year=int(st.session_state.get("lv_smr_accel_start", defaults["smr_accel_start_year"])),
-        smr_accel_gw_per_year=float(st.session_state.get("lv_smr_accel_rate", defaults["smr_accel_gw_per_year"])),
-        smr_post2040_share=smr_share_final / 100.0,
-        post2040_global_growth_gw=st.session_state.get("lv_post2040_gw", defaults["post2040_global_growth_gw"]),
-        china_post2040_gw=st.session_state.get("lv_china_gw", defaults["china_post2040_gw"]),
-        show_iaea_low=st.session_state.get("lv_iaea_low", True),
-        show_iaea_high=st.session_state.get("lv_iaea_high", True),
-        show_iea_steps=st.session_state.get("lv_iea_steps", True),
-        show_iea_aps=st.session_state.get("lv_iea_aps", False),
-        show_iea_low_nuclear=st.session_state.get("lv_iea_low_nuc", True),
-        show_historical=st.session_state.get("lv_show_hist", True),
-        show_transition_marker=st.session_state.get("lv_show_trans", True),
-        compare_scenarios=st.session_state.get("lv_compare", []),
-        selected_regions=selected_regions,
-    )
-
-    # ── Save / Load scenario ───────────────────────────────────────────────
-    st.sidebar.markdown("---")
-    with st.sidebar.expander("💾 Save / Load Scenario", expanded=False):
-        # Save
-        safe_name = state.name.lower().replace(" ", "_")
-        filename = f"nuclear_scenario_{safe_name}_{date.today()}.json"
-        st.download_button(
-            label="⬇ Download current scenario (.json)",
-            data=build_save_payload(state),
-            file_name=filename,
-            mime="application/json",
-            use_container_width=True,
-            help="Downloads all lever positions as a JSON file you can reload later.",
-        )
-
-        st.caption(
-            "The downloaded file captures every lever position — extension policy, "
-            "pipeline rates, delay adder, post-2040 growth, SMR settings, display "
-            "toggles, and geography filter."
-        )
-
-        st.markdown("**Load a saved scenario**")
-        uploaded = st.file_uploader(
-            "Upload a scenario JSON file",
-            type=["json"],
-            key="scenario_upload",
-            label_visibility="collapsed",
-        )
-        if uploaded is not None:
-            try:
-                payload = json.loads(uploaded.read())
-                if payload.get("version") != 1:
-                    st.error("Unrecognised file format (version mismatch).")
-                else:
-                    apply_loaded_scenario(payload)
-                    loaded_name = payload.get("scenario_name", "saved scenario")
-                    saved_at = payload.get("saved_at", "unknown date")
-                    st.success(
-                        f"Loaded **{loaded_name}** (saved {saved_at}). "
-                        "Click **▶ Update Projections** to apply."
-                    )
-                    st.rerun()
-            except (json.JSONDecodeError, KeyError) as e:
-                st.error(f"Could not parse scenario file: {e}")
-
-    return state, submitted
+def render_lever_panel() -> tuple:
+    """Backward-compatible alias for render_sidebar_panel()."""
+    return render_sidebar_panel()
