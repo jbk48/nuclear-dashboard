@@ -64,6 +64,35 @@ def get_all_scenarios(db_path: Path = DB_PATH) -> pd.DataFrame:
 
 # ── What-If projection ────────────────────────────────────────────────────
 
+def run_what_if_all_regions(
+    scenario_id: str,
+    what_if_overrides: dict,
+    db_path: Path = DB_PATH,
+) -> dict:
+    """
+    Run a what-if projection and return results as {region: DataFrame},
+    matching the format of all_projections[scenario_id].
+    Does NOT write to the projections table.
+    """
+    from config import REGIONS
+    conn = _conn(db_path)
+    rows = run_projection(
+        conn, scenario_id,
+        what_if_overrides=what_if_overrides,
+        write_to_db=False,
+    )
+    conn.close()
+    df = pd.DataFrame(rows)
+    cols = ["year", "capacity_operating_gw", "retirements_this_year_gw",
+            "additions_this_year_gw", "capacity_retired_ytd_gw",
+            "capacity_added_ytd_gw", "is_bottom_up"]
+    result = {}
+    for region in REGIONS + ["Global"]:
+        rdf = df[df["region"] == region][cols].sort_values("year").reset_index(drop=True)
+        result[region] = rdf
+    return result
+
+
 def run_what_if_projection(
     scenario_id: str,
     what_if_overrides: dict,

@@ -21,7 +21,7 @@ from model.api import (
     write_and_run_custom_scenario, get_country_capacity,
     get_full_reactor_download, cleanup_stale_custom_scenarios,
     get_tech_projection, TECH_GROUPS,
-    run_what_if_projection, get_reactor_options,
+    run_what_if_projection, run_what_if_all_regions, get_reactor_options,
 )
 from dashboard.charts import (
     chart1_global_projection,
@@ -477,6 +477,17 @@ geo_filtered = len(sel_regions) < len(REGIONS)
 
 # Per-region projections and historical (already filtered to sel_regions)
 _proj_source_dict = custom_projection if custom_projection is not None else all_projections[sc_id]
+
+# ── What-if substitution: if a what-if has been run, override all chart data ──
+_wi_proj_all = st.session_state.get("wi_proj_all")
+_wi_active = (
+    _wi_proj_all is not None
+    and (bool(st.session_state.get("wi_overrides")) or bool(st.session_state.get("wi_synthetic")))
+)
+if _wi_active:
+    _proj_source_dict = _wi_proj_all
+    proj_global = _wi_proj_all.get("Global", proj_global)
+
 proj_by_region = {r: _proj_source_dict[r] for r in sel_regions if r in _proj_source_dict}
 hist_by_region = {r: historical_all[r] for r in sel_regions if r in historical_all}
 
@@ -589,6 +600,21 @@ if geo_filtered:
     )
 
 # ── Chart tabs ─────────────────────────────────────────────────────────────
+# ── What-if active banner ──────────────────────────────────────────────────
+if _wi_active:
+    _n_overrides = len(st.session_state.get("wi_overrides", []))
+    _n_synthetic = len(st.session_state.get("wi_synthetic", []))
+    _parts = []
+    if _n_overrides:
+        _parts.append(f"{_n_overrides} reactor override{'s' if _n_overrides != 1 else ''}")
+    if _n_synthetic:
+        _parts.append(f"{_n_synthetic} synthetic build batch{'es' if _n_synthetic != 1 else ''}")
+    st.warning(
+        f"🔬 **What-If mode active** — all charts reflect your scenario "
+        f"({', '.join(_parts)}). Go to the **What-If tab** to edit or clear.",
+        icon=None,
+    )
+
 tab1, tab2, tab3, tab4, tab5, tab6, tab_wi = st.tabs([
     "📈 Global Projection",
     "📊 Capacity Breakdown",
@@ -1206,6 +1232,7 @@ with tab_wi:
                 st.session_state["wi_overrides"] = []
                 st.session_state["wi_synthetic"] = []
                 st.session_state["wi_result"]    = None
+                st.session_state["wi_proj_all"]  = None
                 st.rerun()
 
         if run_wi:
@@ -1218,14 +1245,15 @@ with tab_wi:
             if synthetic:
                 wi_dict["__synthetic__"] = synthetic
 
-            with st.spinner("Running what-if projection…"):
+            with st.spinner("Running what-if projection across all regions…"):
                 try:
-                    wi_proj = run_what_if_projection(
+                    wi_all = run_what_if_all_regions(
                         scenario_id=_active_db_id,
                         what_if_overrides=wi_dict,
-                        region="Global",
                     )
-                    st.session_state["wi_result"] = wi_proj
+                    st.session_state["wi_proj_all"] = wi_all
+                    st.session_state["wi_result"]   = wi_all.get("Global")
+                    st.rerun()
                 except Exception as e:
                     st.error(f"Projection failed: {e}")
 
