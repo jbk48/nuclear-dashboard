@@ -22,6 +22,7 @@ from model.api import (
     get_full_reactor_download, cleanup_stale_custom_scenarios,
     get_tech_projection, TECH_GROUPS,
     run_what_if_projection, run_what_if_all_regions, get_reactor_options,
+    get_what_if_country_capacity,
 )
 from dashboard.charts import (
     chart1_global_projection,
@@ -350,6 +351,20 @@ def _build_scenario_export(
                 row[0].font = Font(bold=True)
 
     return buf.getvalue()
+
+
+# ── What-if override dict builder ────────────────────────────────────────
+def _build_wi_overrides_dict() -> dict:
+    """Rebuild the what_if_overrides dict from session state for API calls."""
+    ov_dict: dict = {}
+    for o in st.session_state.get("wi_overrides", []):
+        rid = o["reactor_id"]
+        if rid not in ov_dict:
+            ov_dict[rid] = {}
+        ov_dict[rid][o["field"]] = o["value"]
+    if st.session_state.get("wi_synthetic"):
+        ov_dict["__synthetic__"] = st.session_state["wi_synthetic"]
+    return ov_dict
 
 
 # ── Geography-aware aggregation helpers ───────────────────────────────────
@@ -963,7 +978,13 @@ with tab5:
         )
 
     with st.spinner("Loading country data…"):
-        country_df = load_country_capacity(year=snapshot_year, scenario_id=_active_db_id)
+        if _wi_active:
+            _wi_overrides_dict = _build_wi_overrides_dict()
+            country_df = get_what_if_country_capacity(
+                year=snapshot_year, scenario_id=_active_db_id,
+                what_if_overrides=_wi_overrides_dict)
+        else:
+            country_df = load_country_capacity(year=snapshot_year, scenario_id=_active_db_id)
 
     fig7 = chart7_country_bar(
         country_df=country_df,
@@ -1030,7 +1051,13 @@ with tab6:
             )
 
     with st.spinner("Loading map data…"):
-        map_country_df = load_country_capacity(year=map_year, scenario_id=_active_db_id)
+        if _wi_active:
+            _wi_overrides_dict = _build_wi_overrides_dict()
+            map_country_df = get_what_if_country_capacity(
+                year=map_year, scenario_id=_active_db_id,
+                what_if_overrides=_wi_overrides_dict)
+        else:
+            map_country_df = load_country_capacity(year=map_year, scenario_id=_active_db_id)
 
     if geo_filtered:
         map_country_df = map_country_df[map_country_df["region"].isin(sel_regions)]
@@ -1236,15 +1263,7 @@ with tab_wi:
                 st.rerun()
 
         if run_wi:
-            wi_dict: dict = {}
-            for ov in overrides:
-                rid = ov["reactor_id"]
-                if rid not in wi_dict:
-                    wi_dict[rid] = {}
-                wi_dict[rid][ov["field"]] = ov["value"]
-            if synthetic:
-                wi_dict["__synthetic__"] = synthetic
-
+            wi_dict = _build_wi_overrides_dict()
             with st.spinner("Running what-if projection across all regions…"):
                 try:
                     wi_all = run_what_if_all_regions(

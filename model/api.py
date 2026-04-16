@@ -595,6 +595,145 @@ def add_region_adder(
 
 # ── Country-level capacity snapshot ───────────────────────────────────────
 
+def get_what_if_country_capacity(
+    year: int,
+    scenario_id: str,
+    what_if_overrides: dict,
+    db_path: Path = DB_PATH,
+) -> pd.DataFrame:
+    """
+    Per-country capacity snapshot with what-if overrides applied in-memory.
+    Mirrors get_country_capacity() but patches the operating fleet and
+    retirement schedule exactly as run_projection() does.
+    """
+    from model.retirement import build_retirement_schedule
+    from model.pipeline import build_pipeline
+
+    conn = _conn(db_path)
+    cur = conn.cursor()
+
+    reactor_overrides = {k: v for k, v in what_if_overrides.items()
+                         if k != "__synthetic__"}
+
+    # Build and patch retirement schedule
+    retirement_schedule = build_retirement_schedule(conn, scenario_id)
+    for rid, ov in reactor_overrides.items():
+        if "retirement_year" in ov:
+            retirement_schedule[rid] = ov["retirement_year"]
+
+    # Load base operating fleet
+    cur.execute("""
+        SELECT reactor_id, country, region, status,
+               COALESCE(restart_capacity_mw, net_capacity_mw, 0) as cap_mw,
+               restart_date
+        FROM reactors
+        WHERE status IN ('Operating', 'LongTermShutdown', 'Restarted')
+    """)
+    fleet = list(cur.fetchall())
+
+    # Pull in any overridden reactors not in the base fleet
+    fleet_ids = {r[0] for r in fleet}
+    extra_ids = [rid for rid in reactor_overrides if rid not in fleet_ids]
+    if extra_ids:
+        placeholders = ",".join("?" * len(extra_ids))
+        cur.execute(f"""
+            SELECT reactor_id, country, region, status,
+                   COALESCE(restart_capacity_mw, net_capacity_mw, 0) as cap_mw,
+                   restart_date
+            FROM reactors WHERE reactor_id IN ({placeholders})
+        """, extra_ids)
+        fleet.extend(cur.fetchall())
+
+    # Apply fleet overrides
+    patched_fleet = []
+    for (rid, country, region, status, cap_mw, restart_date) in fleet:
+        if rid in reactor_overrides:
+            ov = reactor_overrides[rid]
+            status       = ov.get("status",       status)
+            cap_mw       = ov.get("capacity_mw",  cap_mw)
+            restart_date = ov.get("restart_date", restart_date)
+        patched_fleet.append((rid, country, region, status, cap_mw, restart_date))
+
+    operating_rows = []
+    for rid, country, region, status, cap_mw, restart_date in patched_fleet:
+        if status == "LongTermShutdown":
+            if not restart_date or int(restart_date[:4]) > year:
+                continue
+        ret_year = retirement_schedule.get(rid)
+        if ret_year is None or ret_year > year:
+            operating_rows.append({"country": country, "region": region, "cap_mw": cap_mw})
+
+    # Build and patch pipeline
+    pipeline = build_pipeline(conn, scenario_id)
+    if any("expected_online_year" in v or "pipeline_probability" in v
+           for v in reactor_overrides.values()):
+        new_pipeline = []
+        for r in pipeline:
+            rid = r.get("reactor_id")
+            if rid and rid in reactor_overrides:
+                ov = reactor_overrides[rid]
+                r = dict(r)
+                if "expected_online_year" in ov:
+                    r["effective_online_year"] = int(ov["expected_online_year"])
+                if "pipeline_probability" in ov:
+                    r["expected_capacity_mw"] = (
+                        r.get("net_capacity_mw", 0) * float(ov["pipeline_probability"]))
+            new_pipeline.append(r)
+        pipeline = new_pipeline
+
+    pipeline_rows = []
+    for r in pipeline:
+        eff_yr = r.get("effective_online_year")
+        if eff_yr and eff_yr <= year:
+            pipeline_rows.append({
+                "country": r["country"], "region": r["region"],
+                "cap_mw": r["expected_capacity_mw"],
+            })
+
+    # Synthetic new builds: attribute to the region's largest country (approximate)
+    # For the map/snapshot, synthetic builds are shown as a region-level addition
+    if "__synthetic__" in what_if_overrides:
+        # Get country→region mapping to pick a representative country per region
+        cur.execute("SELECT country, region FROM reactors GROUP BY country, region")
+        country_region = {}
+        for c, r in cur.fetchall():
+            country_region.setdefault(r, c)
+        for batch in what_if_overrides["__synthetic__"]:
+            reg      = batch.get("region")
+            cap_mw   = float(batch.get("capacity_mw", 0))
+            per_year = int(batch.get("per_year", 1))
+            start    = int(batch.get("start_year", BASELINE_YEAR + 1))
+            n_years  = int(batch.get("n_years", 1))
+            if reg and cap_mw > 0 and start <= year < start + n_years:
+                rep_country = country_region.get(reg, reg)
+                years_online = year - start + 1
+                pipeline_rows.append({
+                    "country": rep_country, "region": reg,
+                    "cap_mw": cap_mw * per_year * years_online,
+                })
+
+    conn.close()
+
+    df_op = (pd.DataFrame(operating_rows) if operating_rows
+             else pd.DataFrame(columns=["country", "region", "cap_mw"]))
+    df_pipe = (pd.DataFrame(pipeline_rows) if pipeline_rows
+               else pd.DataFrame(columns=["country", "region", "cap_mw"]))
+
+    op_agg   = (df_op.groupby(["country", "region"])["cap_mw"].sum()
+                .reset_index().rename(columns={"cap_mw": "operating_mw"}))
+    pipe_agg = (df_pipe.groupby(["country", "region"])["cap_mw"].sum()
+                .reset_index().rename(columns={"cap_mw": "pipeline_mw"}))
+
+    merged = op_agg.merge(pipe_agg, on=["country", "region"], how="outer").fillna(0)
+    merged["operating_gw"] = (merged["operating_mw"] / 1000).round(3)
+    merged["pipeline_gw"]  = (merged["pipeline_mw"]  / 1000).round(3)
+    merged["total_gw"]     = (merged["operating_gw"] + merged["pipeline_gw"]).round(3)
+
+    return (merged[["country", "region", "operating_gw", "pipeline_gw", "total_gw"]]
+            .sort_values("total_gw", ascending=False)
+            .reset_index(drop=True))
+
+
 def get_country_capacity(
     year: int = 2026,
     scenario_id: str = "base",
