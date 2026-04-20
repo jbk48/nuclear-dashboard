@@ -127,9 +127,19 @@ def run_projection(
                 retirement_schedule[rid] = ov["retirement_year"]
 
         # Load any overridden reactors not currently in the operating fleet
-        # (e.g. PermanentShutdown units being restarted in the what-if)
+        # (e.g. PermanentShutdown units being restarted in the what-if).
+        # IMPORTANT: only fetch reactors that carry fleet-level overrides
+        # (restart_date / status / capacity_mw).  Reactors whose override is
+        # purely pipeline-level (pipeline_probability / expected_online_year)
+        # must NOT be pulled into the operating fleet — doing so would silently
+        # add them as full-capacity operating units and inflate capacity.
+        _FLEET_OVERRIDE_FIELDS = {"status", "capacity_mw", "restart_date"}
         fleet_ids = {r[0] for r in operating_fleet}
-        extra_ids = [rid for rid in reactor_overrides if rid not in fleet_ids]
+        extra_ids = [
+            rid for rid in reactor_overrides
+            if rid not in fleet_ids
+            and bool(_FLEET_OVERRIDE_FIELDS & reactor_overrides[rid].keys())
+        ]
         if extra_ids:
             placeholders = ",".join("?" * len(extra_ids))
             cur.execute(f"""

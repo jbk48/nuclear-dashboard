@@ -72,6 +72,7 @@ def chart1_global_projection(
     show_historical: bool = True,
     show_benchmarks: dict[str, bool] = None,
     show_transition_marker: bool = True,
+    base_df: pd.DataFrame | None = None,    # dotted base line shown when what-if active
 ) -> go.Figure:
     """
     Chart 1 — Global Capacity: History & Projection (hero chart).
@@ -143,6 +144,17 @@ def chart1_global_projection(
                     "<i>Top-down projection</i><extra></extra>"
                 ),
             ))
+
+    # Dotted base line — shown when what-if is active to highlight the delta
+    if base_df is not None and not base_df.empty:
+        fig.add_trace(go.Scatter(
+            x=base_df["year"], y=base_df["capacity_operating_gw"],
+            name="Base (pre-scenario)",
+            mode="lines",
+            line=dict(color="#aaaaaa", width=1.8, dash="dot"),
+            opacity=0.7,
+            hovertemplate="<b>Base</b><br>Year: %{x}<br>Capacity: %{y:.1f} GW<extra></extra>",
+        ))
 
     # Benchmark reference lines
     _add_benchmark_lines(fig, benchmarks, show_benchmarks)
@@ -981,8 +993,8 @@ def chart_map(
             thickness=14,
             len=0.6,
         ),
-        marker_line_color="white",
-        marker_line_width=0.5,
+        marker_line_color="#2d8a4e",
+        marker_line_width=1.2,
     ))
 
     fig.update_layout(

@@ -34,7 +34,11 @@ from dashboard.charts import (
     chart_map,
     chart_what_if_diff,
 )
-from dashboard.levers import render_lever_panel, render_sidebar_panel, render_lab_panel, ScenarioState, PRESET_DEFAULTS
+from dashboard.levers import (
+    render_lever_panel, render_sidebar_panel, render_lab_panel,
+    ScenarioState, PRESET_DEFAULTS,
+    LARGE_PIPELINE_PRESETS, SMR_PIPELINE_PRESETS,
+)
 
 # ── Page config ────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -438,6 +442,184 @@ def _levers_match_preset(state: ScenarioState, preset_id: str) -> bool:
         abs(state.china_post2040_gw - pd_.get("china_post2040_gw", 0)) < 0.1
     )
 
+def _build_scenario_bullets(
+    state: "ScenarioState",
+    sc_id: str,
+    wi_overrides: list,
+    wi_synthetic: list,
+) -> list[str]:
+    """
+    Generate brief directional impact bullets for the Scenario Lab diff panel.
+    Compares the current ScenarioState against the starting preset (sc_id),
+    then summarises any reactor overrides and synthetic builds.
+    ⬆️ = growth driver / accelerator   ⬇️ = downward pressure / delayer
+    """
+    bullets: list[str] = []
+    pd_ = PRESET_DEFAULTS.get(sc_id, PRESET_DEFAULTS["base"])
+
+    # ── Life extension policy ────────────────────────────────────────────────
+    ext_def  = pd_.get("extension_policy_global", "CurrentPolicy")
+    ext_curr = state.extension_policy_global
+    if ext_curr != ext_def:
+        _ext_map = {
+            "ExtendedOperations":   ("⬆️", "Extended Operations — all reactors run to regulatory max life, expanding the operating fleet"),
+            "AcceleratedRetirement":("⬇️", "Accelerated Retirement — no new licence extensions, fleet declines faster"),
+            "CurrentPolicy":        ("➡️", "Current Policy — reverted to country-specific licensing rules"),
+        }
+        arrow, desc = _ext_map.get(ext_curr, ("~", ext_curr))
+        bullets.append(f"{arrow} **Reactor life extension**: {desc}")
+
+    # ── Large reactor pipeline realization ───────────────────────────────────
+    lpp     = LARGE_PIPELINE_PRESETS[pd_.get("large_pipeline_preset", "medium")]
+    luc_def = int(lpp["uc_rate"]       * 100)
+    lpl_def = int(lpp["planned_rate"]  * 100)
+    lpr_def = int(lpp["proposed_rate"] * 100)
+    luc_cur = int(state.pipeline_uc_rate       * 100)
+    lpl_cur = int(state.pipeline_planned_rate  * 100)
+    lpr_cur = int(state.pipeline_proposed_rate * 100)
+    if luc_cur != luc_def or lpl_cur != lpl_def or lpr_cur != lpr_def:
+        score = (luc_cur - luc_def) + (lpl_cur - lpl_def) + (lpr_cur - lpr_def)
+        arrow = "⬆️" if score > 0 else "⬇️"
+        bullets.append(
+            f"{arrow} **Large reactor pipeline**: UC {luc_cur}% / Planned {lpl_cur}% / Proposed {lpr_cur}%"
+            f" (default {luc_def}% / {lpl_def}% / {lpr_def}%)"
+        )
+
+    # ── SMR pipeline realization ─────────────────────────────────────────────
+    spp     = SMR_PIPELINE_PRESETS[pd_.get("smr_pipeline_preset", "medium")]
+    suc_def = int(spp["uc_rate"]       * 100)
+    spl_def = int(spp["planned_rate"]  * 100)
+    spr_def = int(spp["proposed_rate"] * 100)
+    suc_cur = int(state.smr_uc_rate       * 100)
+    spl_cur = int(state.smr_planned_rate  * 100)
+    spr_cur = int(state.smr_proposed_rate * 100)
+    if suc_cur != suc_def or spl_cur != spl_def or spr_cur != spr_def:
+        score = (suc_cur - suc_def) + (spl_cur - spl_def) + (spr_cur - spr_def)
+        arrow = "⬆️" if score > 0 else "⬇️"
+        bullets.append(
+            f"{arrow} **SMR pipeline**: UC {suc_cur}% / Planned {spl_cur}% / Proposed {spr_cur}%"
+            f" (default {suc_def}% / {spl_def}% / {spr_def}%)"
+        )
+
+    # ── Construction delay ───────────────────────────────────────────────────
+    delay_def = pd_.get("construction_delay_adder", 0)
+    delay_cur = state.construction_delay_adder
+    if abs(delay_cur - delay_def) >= 0.5:
+        if delay_cur > delay_def:
+            bullets.append(
+                f"⬇️ **Construction delay**: +{delay_cur:.0f} yr"
+                f" (default +{delay_def:.0f} yr) — all pipeline additions pushed back"
+            )
+        else:
+            bullets.append(
+                f"⬆️ **Construction delay**: +{delay_cur:.0f} yr"
+                f" (default +{delay_def:.0f} yr) — pipeline additions pulled forward"
+            )
+
+    # ── SMR pre-2040 acceleration ────────────────────────────────────────────
+    accel_def = float(pd_.get("smr_accel_gw_per_year", 0))
+    accel_cur = state.smr_accel_gw_per_year
+    if accel_cur > max(accel_def, 0.05):
+        bullets.append(
+            f"⬆️ **SMR pre-2040 acceleration**: +{accel_cur:.1f} GW/yr"
+            f" from {state.smr_accel_start_year} — extra SMR capacity above announced pipeline"
+        )
+    elif accel_def > 0.05 and accel_cur < accel_def - 0.05:
+        bullets.append(
+            f"⬇️ **SMR acceleration reduced**: {accel_cur:.1f} GW/yr (default {accel_def:.1f})"
+        )
+
+    # ── Post-2040 global new build ───────────────────────────────────────────
+    p40_def = float(pd_.get("post2040_global_growth_gw", 28.1))
+    p40_cur = state.post2040_global_growth_gw
+    if abs(p40_cur - p40_def) > 0.5:
+        if p40_cur > p40_def:
+            bullets.append(
+                f"⬆️ **Post-2040 new build**: {p40_cur:.1f} GW/yr"
+                f" (default {p40_def:.1f}) — higher long-run capacity growth"
+            )
+        else:
+            bullets.append(
+                f"⬇️ **Post-2040 new build**: {p40_cur:.1f} GW/yr"
+                f" (default {p40_def:.1f}) — lower long-run capacity growth"
+            )
+
+    # ── China post-2040 share ────────────────────────────────────────────────
+    china_def = float(pd_.get("china_post2040_gw", 8.0))
+    china_cur = state.china_post2040_gw
+    if abs(china_cur - china_def) > 0.5:
+        arrow = "⬆️" if china_cur > china_def else "⬇️"
+        bullets.append(
+            f"{arrow} **China post-2040 share**: {china_cur:.1f} GW/yr"
+            f" (default {china_def:.1f}) — shifts regional mix"
+        )
+
+    # ── Reactor overrides ────────────────────────────────────────────────────
+    if wi_overrides:
+        cancelled   = [o for o in wi_overrides
+                       if o["field"] == "pipeline_probability" and float(o["value"]) < 0.1]
+        confirmed   = [o for o in wi_overrides
+                       if o["field"] == "pipeline_probability" and float(o["value"]) >= 0.9]
+        ret_changes = [o for o in wi_overrides if o["field"] == "retirement_year"]
+        restarts    = [o for o in wi_overrides if o["field"] == "restart_date"]
+        cap_changes = [o for o in wi_overrides if o["field"] == "capacity_mw"]
+        other_ov    = [o for o in wi_overrides
+                       if o["field"] not in
+                       {"pipeline_probability", "retirement_year", "restart_date", "capacity_mw"}]
+
+        if cancelled:
+            bullets.append(
+                f"⬇️ **{len(cancelled)} pipeline reactor(s) cancelled**"
+                " — probability → 0, removing those additions from the projection"
+            )
+        if confirmed:
+            bullets.append(
+                f"⬆️ **{len(confirmed)} pipeline reactor(s) confirmed**"
+                " — probability → 1, locking in those additions"
+            )
+        if ret_changes:
+            yrs = [float(o["value"]) for o in ret_changes]
+            avg_yr = sum(yrs) / len(yrs)
+            if avg_yr >= 2045:
+                bullets.append(
+                    f"⬆️ **{len(ret_changes)} reactor life extension(s)**"
+                    f" — retirement year avg ~{avg_yr:.0f}, fleet lives longer"
+                )
+            elif avg_yr <= 2034:
+                bullets.append(
+                    f"⬇️ **{len(ret_changes)} early retirement(s)**"
+                    f" — closure year avg ~{avg_yr:.0f}, capacity removed sooner"
+                )
+            else:
+                bullets.append(
+                    f"~ **{len(ret_changes)} retirement year adjustment(s)**"
+                    f" — avg target ~{avg_yr:.0f}"
+                )
+        if restarts:
+            bullets.append(
+                f"⬆️ **{len(restarts)} reactor restart(s)**"
+                " — previously shutdown units returned to service"
+            )
+        if cap_changes:
+            bullets.append(
+                f"~ **{len(cap_changes)} reactor capacity adjustment(s)**"
+                " — net rating changed on specific units"
+            )
+        if other_ov:
+            bullets.append(f"~ **{len(other_ov)} other reactor override(s)**")
+
+    # ── Synthetic new builds ─────────────────────────────────────────────────
+    for sb in wi_synthetic:
+        gw_yr = sb["capacity_mw"] * sb["per_year"] / 1000
+        bullets.append(
+            f"⬆️ **Synthetic build**: {sb['per_year']} × {int(sb['capacity_mw'])} MW/yr"
+            f" in **{sb['region']}** from {sb['start_year']}"
+            f" for {sb['n_years']} yr (+{gw_yr:.1f} GW/yr)"
+        )
+
+    return bullets
+
+
 custom_projection: dict | None = st.session_state.get("_custom_projection")
 
 # Clear custom if user switched presets (even without clicking Apply in the Lab)
@@ -466,6 +648,17 @@ geo_filtered = len(sel_regions) < len(REGIONS)
 
 # Per-region projections and historical (already filtered to sel_regions)
 _proj_source_dict = custom_projection if custom_projection is not None else all_projections[sc_id]
+
+# Pre-customisation baseline for the Scenario Lab diff chart.
+# Always use the raw preset projection (all_projections[sc_id]) so the chart
+# compares the preset starting-point against whatever the user has built —
+# whether that's lever-only changes, what-if overrides, or both.
+# Using custom_projection here would make both sides identical when only levers
+# change (custom_projection == proj_global_display → delta = 0 everywhere).
+_lab_base_global = (
+    _sum_projections(all_projections[sc_id], sel_regions) if geo_filtered
+    else all_projections[sc_id].get("Global", pd.DataFrame())
+)
 
 # ── What-if substitution: if a what-if has been run, override all chart data ──
 _wi_proj_all = st.session_state.get("wi_proj_all")
@@ -634,6 +827,15 @@ with tab1:
     if geo_filtered:
         st.caption(f"📊 Showing sum of {len(sel_regions)} selected regions — benchmark lines hidden (global comparisons not applicable to regional subsets).")
 
+    # When what-if is active, pass the pre-what-if projection as a dotted base line
+    _base_for_diff = None
+    if _wi_active:
+        _base_proj_key = sc_id if custom_projection is None else "custom"
+        _base_for_diff = (
+            _sum_projections(all_projections[sc_id], sel_regions) if geo_filtered
+            else all_projections[sc_id].get("Global", pd.DataFrame())
+        )
+
     fig1 = chart1_global_projection(
         projections=compare_projs,
         historical=hist_global_display if state.show_historical else pd.DataFrame(),
@@ -643,6 +845,7 @@ with tab1:
         show_historical=state.show_historical,
         show_benchmarks=show_benchmarks,
         show_transition_marker=state.show_transition_marker,
+        base_df=_base_for_diff,
     )
     _t1c1, _t1c2 = st.columns([8, 1])
     with _t1c1:
@@ -873,21 +1076,17 @@ with tab4:
     _no_date = reactors[
         (reactors["status"] == "Planned") & (reactors["expected_online_year"].isna())
     ]
+    _nd_info_text = None
     if not _no_date.empty:
         _nd_gw = _no_date["net_capacity_mw"].sum() / 1000
         _nd_countries = _no_date["country"].value_counts().head(4)
         _nd_summary = ", ".join(f"{c} ({n})" for c, n in _nd_countries.items())
-        st.info(
+        _nd_info_text = (
             f"ℹ️ **{len(_no_date)} Planned reactors ({_nd_gw:.1f} GW) have no announced "
             f"construction-start date and are excluded from all projections.** "
             f"Largest groups: {_nd_summary}. "
             f"These units will appear in projections once an expected online year is confirmed."
         )
-    st.caption(
-        "Annual new capacity additions. Post-2040 SMR share set by the SMR lever. "
-        "Pre-2040 SMR share derived from the scenario-adjusted pipeline "
-        "(technology split) or summed by region (geography split)."
-    )
     fig6 = chart6_additions(
         projections_by_region=proj_by_region,
         reactors=reactors,
@@ -900,6 +1099,13 @@ with tab4:
     _t6c1, _t6c2 = st.columns([8, 1])
     with _t6c1:
         st.plotly_chart(fig6, use_container_width=True)
+        st.caption(
+            "Annual new capacity additions. Post-2040 SMR share set by the SMR lever. "
+            "Pre-2040 SMR share derived from the scenario-adjusted pipeline "
+            "(technology split) or summed by region (geography split)."
+        )
+        if _nd_info_text:
+            st.info(_nd_info_text)
     with _t6c2:
         _t6_rows = []
         for _r in sel_regions:
@@ -959,6 +1165,11 @@ with tab5:
                 what_if_overrides=_wi_overrides_dict)
         else:
             country_df = load_country_capacity(year=snapshot_year, scenario_id=_active_db_id)
+
+    # Normalise country names to title case (DB stores them in ALL CAPS)
+    if "country" in country_df.columns:
+        country_df = country_df.copy()
+        country_df["country"] = country_df["country"].str.title()
 
     fig7 = chart7_country_bar(
         country_df=country_df,
@@ -1117,34 +1328,74 @@ with tab_lab:
 
         st.rerun()
 
-    # ── Diff chart shown after results exist ──────────────────────────────
-    if st.session_state.get("wi_result") is not None:
-        wi_proj   = st.session_state["wi_result"]
-        base_proj = proj_global_display[["year", "capacity_operating_gw",
-                                         "retirements_this_year_gw",
-                                         "additions_this_year_gw",
-                                         "is_bottom_up"]].copy()
+    # ── Diff chart + bullet summary ───────────────────────────────────────
+    # Show whenever there are any active customisations (levers, overrides,
+    # synthetic builds) — not only when wi_result exists.
+    _has_wi_result     = st.session_state.get("wi_result") is not None
+    _has_customisation = (
+        _has_wi_result
+        or bool(st.session_state.get("wi_overrides"))
+        or bool(st.session_state.get("wi_synthetic"))
+        or not _levers_match_preset(state, active_key)
+    )
+
+    if _has_customisation and not _lab_base_global.empty:
+        # Use the what-if projection if available, otherwise the current
+        # (lever-adjusted) display projection as the "what-if" side.
+        if _has_wi_result:
+            wi_proj_for_chart = st.session_state["wi_result"]
+        else:
+            wi_proj_for_chart = proj_global_display
+
+        _base_cols = ["year", "capacity_operating_gw",
+                      "retirements_this_year_gw", "additions_this_year_gw",
+                      "is_bottom_up"]
+        base_proj = _lab_base_global[
+            [c for c in _base_cols if c in _lab_base_global.columns]
+        ].copy()
+
         fig_wi = chart_what_if_diff(
             base_df=base_proj,
-            whatif_df=wi_proj,
-            base_label=f"{active_key.title()} (base)",
-            whatif_label="Scenario Lab",
+            whatif_df=wi_proj_for_chart,
+            base_label=f"{sc_id.title()} (starting point)",
+            whatif_label="Custom scenario",
         )
-        st.plotly_chart(fig_wi, use_container_width=True)
 
-        # Summary delta table
-        delta_rows = []
-        for yr in [2030, 2035, 2040, 2050]:
-            b = base_proj.loc[base_proj["year"] == yr, "capacity_operating_gw"]
-            w = wi_proj.loc[wi_proj["year"] == yr, "capacity_operating_gw"]
-            if not b.empty and not w.empty:
-                delta = round(w.values[0] - b.values[0], 1)
-                delta_rows.append({"Year": yr,
-                                   "Base (GW)": round(b.values[0], 1),
-                                   "What-If (GW)": round(w.values[0], 1),
-                                   "Delta (GW)": f"{'+' if delta >= 0 else ''}{delta}"})
-        if delta_rows:
-            st.dataframe(delta_rows, hide_index=True, use_container_width=False)
+        _col_chart, _col_bullets = st.columns([3, 2], gap="large")
+        with _col_chart:
+            st.plotly_chart(fig_wi, use_container_width=True)
+
+            # Compact delta table beneath the chart
+            delta_rows = []
+            for yr in [2030, 2035, 2040, 2050]:
+                b = base_proj.loc[base_proj["year"] == yr, "capacity_operating_gw"]
+                w = wi_proj_for_chart.loc[
+                    wi_proj_for_chart["year"] == yr, "capacity_operating_gw"
+                ]
+                if not b.empty and not w.empty:
+                    delta = round(w.values[0] - b.values[0], 1)
+                    delta_rows.append({
+                        "Year": yr,
+                        f"{active_key.title()} base (GW)": round(b.values[0], 1),
+                        "Custom (GW)":   round(w.values[0], 1),
+                        "Delta (GW)":    f"{'+' if delta >= 0 else ''}{delta}",
+                    })
+            if delta_rows:
+                st.dataframe(delta_rows, hide_index=True, use_container_width=True)
+
+        with _col_bullets:
+            st.markdown("**What's been customised**")
+            _bullets = _build_scenario_bullets(
+                state,
+                active_key,
+                wi_overrides=st.session_state.get("wi_overrides", []),
+                wi_synthetic=st.session_state.get("wi_synthetic", []),
+            )
+            if _bullets:
+                for _b in _bullets:
+                    st.markdown(f"- {_b}")
+            else:
+                st.caption("No changes from the base preset yet.")
 
 
 # ── Footer & Disclaimer ────────────────────────────────────────────────────

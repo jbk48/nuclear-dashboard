@@ -112,7 +112,7 @@ SMR_PIPELINE_PRESETS = {
     },
 }
 
-DELAY_OPTIONS = [0, 1, 2, 3, 4, 5]
+DELAY_OPTIONS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
 SCENARIO_TO_PIPELINE = {
     "decline":      "low",
@@ -331,6 +331,21 @@ def render_sidebar_panel() -> tuple:
     geography filter, display options, scenario comparison, save/load.
     Returns (ScenarioState, False) — no submitted flag from the sidebar.
     """
+    # ── Apply any pending scenario load BEFORE any widget is instantiated ────
+    # The file uploader stores the raw payload here on the first rerun so we
+    # can write to session-state keys without hitting the
+    # "cannot be modified after widget is instantiated" error.
+    if "_pending_scenario_load" in st.session_state:
+        _pending = st.session_state.pop("_pending_scenario_load")
+        try:
+            apply_loaded_scenario(_pending)
+            st.session_state["_scenario_load_success"] = (
+                _pending.get("scenario_name", "saved scenario"),
+                _pending.get("saved_at", "unknown date"),
+            )
+        except Exception as _load_err:
+            st.session_state["_scenario_load_error"] = str(_load_err)
+
     st.sidebar.title("⚛️ Nuclear Capacity Dashboard")
     st.sidebar.markdown("---")
 
@@ -373,6 +388,14 @@ def render_sidebar_panel() -> tuple:
         st.session_state["lv_smr_uc_pct"]     = int(spp_["uc_rate"]       * 100)
         st.session_state["lv_smr_plan_pct"]   = int(spp_["planned_rate"]  * 100)
         st.session_state["lv_smr_prop_pct"]   = int(spp_["proposed_rate"] * 100)
+        # Clear all what-if state so overrides/projections from the old preset
+        # don't silently carry over to the new one.
+        st.session_state["wi_overrides"]  = []
+        st.session_state["wi_synthetic"]  = []
+        st.session_state["wi_result"]     = None
+        st.session_state["wi_proj_all"]   = None
+        st.session_state.pop("_custom_projection", None)
+        st.session_state.pop("_custom_for_scenario", None)
         st.session_state.last_preset = preset
 
     defaults = PRESET_DEFAULTS.get(preset if preset != "custom" else "base", PRESET_DEFAULTS["base"])
@@ -475,21 +498,34 @@ def render_sidebar_panel() -> tuple:
             label_visibility="collapsed",
         )
         if uploaded is not None:
-            try:
-                payload = json.loads(uploaded.read())
-                if payload.get("version") != 1:
-                    st.error("Unrecognised file format (version mismatch).")
-                else:
-                    apply_loaded_scenario(payload)
-                    loaded_name = payload.get("scenario_name", "saved scenario")
-                    saved_at = payload.get("saved_at", "unknown date")
-                    st.success(
-                        f"Loaded **{loaded_name}** (saved {saved_at}). "
-                        "Go to **Scenario Lab** and click **▶ Apply Scenario** to apply."
-                    )
-                    st.rerun()
-            except (json.JSONDecodeError, KeyError) as e:
-                st.error(f"Could not parse scenario file: {e}")
+            # Use name+size as a fingerprint so we only trigger the apply-rerun
+            # cycle ONCE per distinct file.  Without this guard, the file uploader
+            # keeps the file in session state across reruns, causing an infinite
+            # rerun loop (apply → file still present → store pending → rerun …).
+            _fp = f"{uploaded.name}|{uploaded.size}"
+            if st.session_state.get("_last_processed_upload") != _fp:
+                try:
+                    payload = json.loads(uploaded.read())
+                    if payload.get("version") != 1:
+                        st.error("Unrecognised file format (version mismatch).")
+                    else:
+                        # Mark this file as processed BEFORE the rerun so the
+                        # guard above holds on the next pass.
+                        st.session_state["_last_processed_upload"] = _fp
+                        st.session_state["_pending_scenario_load"] = payload
+                        st.rerun()
+                except (json.JSONDecodeError, KeyError) as e:
+                    st.error(f"Could not parse scenario file: {e}")
+
+        # Show deferred success / error messages written at the top of this function
+        if "_scenario_load_success" in st.session_state:
+            _sname, _sat = st.session_state.pop("_scenario_load_success")
+            st.success(
+                f"Loaded **{_sname}** (saved {_sat}). "
+                "Go to **Scenario Lab** and click **▶ Apply Scenario** to apply."
+            )
+        if "_scenario_load_error" in st.session_state:
+            st.error(f"Could not apply scenario: {st.session_state.pop('_scenario_load_error')}")
 
     return state, False
 
@@ -503,10 +539,8 @@ def render_lab_panel(scenario_id: str, defaults: dict) -> bool:
     (they call st.rerun). The macro levers are inside st.form("lab_form").
     Returns submitted (bool) — True when the form submit button was clicked.
     """
-    st.caption(
-        "Adjust macro scenario levers and/or add per-reactor overrides, then click "
-        "**▶ Apply Scenario** to recompute projections across all regions."
-    )
+    # Check for auto-submit triggered by Claude chat apply
+    _auto_submit = st.session_state.pop("_chat_auto_submit", False)
 
     # ── Initialise session state ──────────────────────────────────────────
     if "wi_overrides" not in st.session_state:
@@ -541,6 +575,209 @@ def render_lab_panel(scenario_id: str, defaults: dict) -> bool:
         label_to_id = {}
         id_to_row = {}
 
+    # ── Claude chat section (top of Lab — primary interaction point) ───────
+    st.markdown("### 💬 Ask Claude")
+    st.caption(
+        "Describe a scenario in plain English and Claude will translate it into model changes. "
+        "You can then fine-tune further using the manual controls below."
+    )
+    with st.expander("💡 What can I ask?", expanded=False):
+        st.markdown("""
+**Macro levers** (affect all reactors globally):
+- *"Switch to extended operations policy — maximum licence life for all reactors"*
+- *"Set pipeline realization to high — include all proposed reactors"*
+- *"Add a 3-year construction delay to all pipeline projects"*
+- *"Increase post-2040 global new build to 50 GW/yr"*
+
+**Synthetic new builds** (hypothetical capacity not in the database):
+- *"Add 5 GW/yr of SMRs in North America starting 2030 for 10 years"*
+- *"Model 3 × 1 GW large reactors per year in Southeast Asia from 2035"*
+
+**Reactor-level overrides** (specific units — search by country or name):
+- *"Retire all French reactors by 2035"*
+- *"Extend the operating life of all US reactors to 2060"*
+- *"Restart the Japanese long-term shutdown reactors in 2027"*
+
+**Economic / indirect scenarios** (Claude will interpret and propose adjustments):
+- *"What if SMR overnight costs drop to $5,000/kW by 2032?"*
+- *"What if there's a major nuclear accident in 2028?"*
+- *"What if carbon prices reach $200/tonne by 2035?"*
+
+After Claude proposes changes, click **✅ Apply changes** — all 6 chart tabs will update. You can then make further manual adjustments below.
+""")
+
+    # Init chat state
+    if "chat_history" not in st.session_state:
+        st.session_state["chat_history"] = []
+    if "chat_pending_response" not in st.session_state:
+        st.session_state["chat_pending_response"] = None
+
+    # Display past history
+    for _msg in st.session_state["chat_history"]:
+        with st.chat_message(_msg["role"]):
+            st.markdown(_msg["content"])
+
+    # Display pending Claude response (awaiting user confirmation)
+    _pending = st.session_state.get("chat_pending_response")
+    if _pending:
+        with st.chat_message("assistant"):
+            st.markdown(_pending["message"])
+            _actions = _pending.get("actions", [])
+            if _actions:
+                st.markdown("**Proposed changes:**")
+                for _a in _actions:
+                    if _a["type"] == "set_lever":
+                        st.markdown(f"- Set **{_a['lever']}** → `{_a['value']}`")
+                    elif _a["type"] == "synthetic_build":
+                        st.markdown(
+                            f"- Add synthetic build: {_a.get('per_year', 1)} × "
+                            f"{_a.get('capacity_mw', 0):.0f} MW/yr in **{_a.get('region')}** "
+                            f"from {_a.get('start_year')} for {_a.get('n_years')} yr"
+                        )
+                    elif _a["type"] == "reactor_override":
+                        st.markdown(
+                            f"- Override reactor `{_a.get('reactor_id')}`: "
+                            f"**{_a.get('field')}** → `{_a.get('value')}`"
+                        )
+                _cap1, _cap2, _cap3 = st.columns([2, 2, 4])
+                with _cap1:
+                    if st.button("✅ Apply changes", type="primary", key="chat_apply_btn"):
+                        from dashboard.claude_chat import apply_claude_actions
+                        _rdf = reactor_opts if _reactor_opts_ok else None
+                        # Retrieve the last user message for safety-filter context
+                        _last_user_msg = ""
+                        for _hm in reversed(st.session_state.get("chat_history", [])):
+                            if _hm.get("role") == "user":
+                                _last_user_msg = _hm.get("content", "")
+                                break
+                        _new_ov, _new_sy, _lv_upd, _warns = apply_claude_actions(
+                            _actions, _rdf, user_message=_last_user_msg
+                        )
+                        for _k, _v in _lv_upd.items():
+                            st.session_state[_k] = _v
+                        # Merge: if a new override targets the same (reactor_id, field)
+                        # as an existing one, the new value wins (drop the old entry).
+                        _existing_ov = st.session_state.get("wi_overrides", [])
+                        if _new_ov:
+                            _new_keys = {(o["reactor_id"], o["field"]) for o in _new_ov}
+                            _existing_ov = [
+                                o for o in _existing_ov
+                                if (o["reactor_id"], o["field"]) not in _new_keys
+                            ]
+                        st.session_state["wi_overrides"] = _existing_ov + _new_ov
+                        st.session_state["wi_synthetic"] = (
+                            st.session_state.get("wi_synthetic", []) + _new_sy
+                        )
+                        if _warns:
+                            st.session_state["_chat_apply_warnings"] = _warns
+                        st.session_state["chat_history"].append(
+                            {"role": "assistant", "content": _pending["message"]}
+                        )
+                        st.session_state["chat_pending_response"] = None
+                        st.session_state["wi_result"] = None
+                        st.session_state["_chat_auto_submit"] = True
+                        st.rerun()
+                with _cap2:
+                    if st.button("✕ Dismiss", key="chat_dismiss_btn"):
+                        st.session_state["chat_history"].append(
+                            {"role": "assistant", "content": _pending["message"]}
+                        )
+                        st.session_state["chat_pending_response"] = None
+                        st.rerun()
+            else:
+                if st.button("OK", key="chat_ok_btn"):
+                    st.session_state["chat_history"].append(
+                        {"role": "assistant", "content": _pending["message"]}
+                    )
+                    st.session_state["chat_pending_response"] = None
+                    st.rerun()
+
+    # Debug expander — shows raw Claude JSON (helps diagnose parsing failures)
+    if st.session_state.get("_chat_last_raw"):
+        with st.expander("🔍 Debug: raw Claude response", expanded=False):
+            st.code(st.session_state["_chat_last_raw"], language="json")
+
+    # Safety warnings from apply_claude_actions (blocked actions)
+    _apply_warnings = st.session_state.pop("_chat_apply_warnings", None)
+    if _apply_warnings:
+        with st.expander("⚠️ Actions blocked by safety filter", expanded=True):
+            st.caption(
+                "The following changes Claude proposed were automatically blocked to prevent "
+                "unintended side-effects on the projection:"
+            )
+            for _w in _apply_warnings:
+                st.warning(_w)
+
+    # Chat input box
+    _chat_input = st.chat_input(
+        "e.g. 'Retire all US reactors by 2035' or 'Add 5 GW/yr SMRs in Asia from 2030'"
+    )
+    if _chat_input:
+        _api_key = ""
+        try:
+            _api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+        except Exception:
+            pass
+
+        if not _api_key:
+            st.error(
+                "No Anthropic API key configured. "
+                "Add `ANTHROPIC_API_KEY` to `.streamlit/secrets.toml` to use Claude."
+            )
+        else:
+            st.session_state["chat_history"].append({"role": "user", "content": _chat_input})
+            with st.spinner("Claude is thinking…"):
+                from dashboard.claude_chat import call_claude
+                _history_for_api = st.session_state["chat_history"][:-1]
+                _response = call_claude(
+                    user_message  = _chat_input,
+                    reactor_df    = reactor_opts if _reactor_opts_ok else None,
+                    api_key       = _api_key,
+                    chat_history  = _history_for_api,
+                )
+            import json as _json
+            st.session_state["_chat_last_raw"] = _json.dumps(_response, indent=2)
+            st.session_state["chat_pending_response"] = _response
+            st.rerun()
+
+    # Clear chat + all customisations button
+    _has_any_custom = (
+        st.session_state.get("chat_history")
+        or st.session_state.get("chat_pending_response")
+        or st.session_state.get("wi_overrides")
+        or st.session_state.get("wi_synthetic")
+        or st.session_state.get("_custom_projection")
+    )
+    if _has_any_custom:
+        _clr1, _clr2 = st.columns([3, 2])
+        with _clr1:
+            if st.button("🗑 Clear all customisations & return to base scenario", key="lab_clear_all_btn"):
+                # Clear what-if overrides and projections
+                st.session_state["chat_history"] = []
+                st.session_state["chat_pending_response"] = None
+                st.session_state["wi_overrides"] = []
+                st.session_state["wi_synthetic"] = []
+                st.session_state["wi_result"] = None
+                st.session_state["wi_proj_all"] = None
+                st.session_state.pop("_custom_projection", None)
+                st.session_state.pop("_custom_for_scenario", None)
+                st.session_state.pop("_chat_last_raw", None)
+                # Also reset all lever session-state keys so form widgets
+                # revert to the current preset's defaults on next render
+                for _lk in [
+                    "lv_ext_policy",
+                    "lv_large_uc_pct", "lv_large_plan_pct", "lv_large_prop_pct",
+                    "lv_smr_uc_pct",   "lv_smr_plan_pct",   "lv_smr_prop_pct",
+                    "lv_delay",
+                    "lv_smr_accel_start", "lv_smr_accel_rate",
+                    "lv_smr_share_pct",
+                    "lv_post2040_gw", "lv_china_gw",
+                ]:
+                    st.session_state.pop(_lk, None)
+                st.rerun()
+
+    st.markdown("---")
+
     _PIPELINE_STATUSES = {"UnderConstruction", "Planned", "Proposed"}
     _FLEET_FIELDS    = ["retirement_year", "restart_date", "status", "capacity_mw"]
     _PIPELINE_FIELDS = ["expected_online_year", "pipeline_probability", "capacity_mw"]
@@ -555,7 +792,8 @@ def render_lab_panel(scenario_id: str, defaults: dict) -> bool:
                 selected_label = st.selectbox(
                     "Reactor", options=[""] + list(label_to_id.keys()),
                     key="wi_reactor_sel", label_visibility="collapsed",
-                    placeholder="Search for a reactor…",
+                    placeholder="Search by name, country, or status…",
+                    help="All reactors in the database are searchable — type a country name, reactor name, or status to filter.",
                 )
             _sel_status = (id_to_row[label_to_id[selected_label]]["status"]
                            if selected_label else None)
@@ -880,6 +1118,10 @@ def render_lab_panel(scenario_id: str, defaults: dict) -> bool:
             use_container_width=True,
             type="primary",
         )
+
+    # Auto-submit triggered by Claude chat "Apply these changes" button
+    if _auto_submit:
+        submitted = True
 
     return submitted
 
