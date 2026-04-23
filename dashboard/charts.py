@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 import pandas as pd
 from typing import Optional
-from config import TRANSITION_YEAR as _TRANSITION_YEAR
+from config import TRANSITION_YEAR as _TRANSITION_YEAR, BASELINE_YEAR as _BASELINE_YEAR
 
 # ── Consistent color palette ───────────────────────────────────────────────
 REGION_COLORS = {
@@ -101,6 +101,30 @@ def chart1_global_projection(
             marker=dict(size=5),
             hovertemplate="<b>%{x}</b><br>Observed: %{y:.1f} GW<extra></extra>",
         ))
+
+    # Anchor: snap each scenario's BASELINE_YEAR projection value to the
+    # historical observed value for that year.  The bottom-up model and the
+    # IAEA historical tables use slightly different unit coverage (e.g. Ukraine
+    # ambiguous-status units), producing a ~4 GW mismatch that is invisible at
+    # global scale but creates a visible jump when geographies are filtered.
+    # This is a display-only fix — underlying model data is not modified.
+    _hist_anchor: float | None = None
+    if show_historical and not historical.empty:
+        _h = historical.loc[historical["year"] == _BASELINE_YEAR, "capacity_gw"]
+        if not _h.empty:
+            _hist_anchor = float(_h.iloc[0])
+
+    if _hist_anchor is not None:
+        projections = {
+            sid: (
+                df.assign(**{"capacity_operating_gw": df["capacity_operating_gw"].where(
+                    df["year"] != _BASELINE_YEAR, _hist_anchor
+                )})
+                if df is not None and not df.empty and _BASELINE_YEAR in df["year"].values
+                else df
+            )
+            for sid, df in projections.items()
+        }
 
     # Scenario lines — active first (solid), comparisons secondary (dashed)
     scenarios_to_plot = [active_scenario] + [s for s in compare_scenarios if s != active_scenario]

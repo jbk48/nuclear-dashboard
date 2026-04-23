@@ -892,6 +892,7 @@ def get_tech_projection(
     smr_accel_start_year: int = 0,
     smr_accel_gw_per_year: float = 0.0,
     db_path: Path = DB_PATH,
+    what_if_overrides: dict | None = None,
 ) -> pd.DataFrame:
     """
     Return year-by-year capacity by technology group (PWR/BWR/PHWR/SMR/Other)
@@ -945,6 +946,59 @@ def get_tech_projection(
             r for r in pipeline
             if regions is None or r["region"] in regions
         ]
+
+        # ── Apply what-if overrides to retirement schedule + pipeline ──────
+        if what_if_overrides:
+            _reactor_ov = {k: v for k, v in what_if_overrides.items()
+                           if k != "__synthetic__"}
+            # retirement_year overrides
+            for rid, ov in _reactor_ov.items():
+                if "retirement_year" in ov:
+                    retirement_schedule[rid] = int(ov["retirement_year"])
+            # capacity_mw overrides — convert fleet rows to mutable lists
+            if any("capacity_mw" in v for v in _reactor_ov.values()):
+                fleet = [list(row) for row in fleet]
+                for row in fleet:
+                    if row[0] in _reactor_ov and "capacity_mw" in _reactor_ov[row[0]]:
+                        row[5] = float(_reactor_ov[row[0]]["capacity_mw"])
+            # pipeline_probability / expected_online_year overrides
+            if any("pipeline_probability" in v or "expected_online_year" in v
+                   for v in _reactor_ov.values()):
+                new_pipe: list = []
+                for r in pipe_filtered:
+                    rid = r.get("reactor_id")
+                    if rid and rid in _reactor_ov:
+                        ov = _reactor_ov[rid]
+                        r = dict(r)
+                        if "expected_online_year" in ov:
+                            r["effective_online_year"] = int(ov["expected_online_year"])
+                        if "pipeline_probability" in ov:
+                            r["expected_capacity_mw"] = (
+                                r.get("net_capacity_mw", 0) * float(ov["pipeline_probability"])
+                            )
+                    new_pipe.append(r)
+                pipe_filtered = new_pipe
+            # __synthetic__ builds — add as PWR large reactors
+            if "__synthetic__" in what_if_overrides:
+                for batch in what_if_overrides["__synthetic__"]:
+                    reg = batch.get("region")
+                    if regions and reg not in regions:
+                        continue
+                    cap_mw  = float(batch.get("capacity_mw", 0))
+                    per_yr  = int(batch.get("per_year", 1))
+                    start   = int(batch.get("start_year", BASELINE_YEAR + 1))
+                    n_years = int(batch.get("n_years", 1))
+                    if reg and cap_mw > 0:
+                        for yr_off in range(n_years):
+                            pipe_filtered.append({
+                                "reactor_id":           f"__synth_{reg}_{start+yr_off}__",
+                                "region":               reg,
+                                "reactor_type":         "PWR",
+                                "is_smr":               0,
+                                "effective_online_year": start + yr_off,
+                                "expected_capacity_mw": cap_mw * per_yr,
+                                "net_capacity_mw":      cap_mw * per_yr,
+                            })
 
         # Historical reference totals for scaling (region-filtered if needed)
         if regions:
