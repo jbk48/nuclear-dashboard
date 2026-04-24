@@ -17,11 +17,18 @@ Top-down (post-transition_year):
 Continuity condition enforced: capacity_top_down(transition_year) ≡
     capacity_bottom_up(transition_year)  [guaranteed by design]
 """
+from __future__ import annotations
+
 import sqlite3
 from collections import defaultdict
+from typing import TYPE_CHECKING
+
 from config import BASELINE_YEAR, PROJECTION_END_YEAR, REGIONS
 from model.retirement import build_retirement_schedule
 from model.pipeline import build_pipeline
+
+if TYPE_CHECKING:
+    from model.state import ProjectionState
 
 
 def get_scenario_params(conn: sqlite3.Connection, scenario_id: str) -> dict:
@@ -87,97 +94,118 @@ def run_projection(
     end_year: int = PROJECTION_END_YEAR,
     what_if_overrides: dict | None = None,
     write_to_db: bool = True,
+    state: "ProjectionState | None" = None,
 ) -> list[dict]:
     """
     Compute annual capacity projection for the given scenario.
     Returns a list of row dicts matching the projections table schema.
-    Also writes results to the projections table.
+    Writes results to the projections table unless write_to_db=False.
+
+    Pass a pre-built ProjectionState to skip all DB reads and override
+    application (the state already has overrides applied).  When state is
+    provided, write_to_db must be False (ephemeral what-if run).
     """
-    params = get_scenario_params(conn, scenario_id)
-    transition_year = params.get("transition_year") or 2040
+    if state is not None and write_to_db:
+        raise ValueError(
+            "write_to_db=True is not supported when a ProjectionState is provided. "
+            "ProjectionState is for ephemeral what-if runs only."
+        )
 
-    # ── Build inputs ─────────────────────────────────────────────────────
-    retirement_schedule = build_retirement_schedule(conn, scenario_id)   # {rid: ret_year}
-    pipeline            = build_pipeline(conn, scenario_id)              # list of dicts
-    adders              = get_region_adders(conn, scenario_id)           # {(yr,reg): gw}
+    cur = conn.cursor() if write_to_db else None
 
-    post2040_by_region = get_regional_post2040(
-        conn, scenario_id, params["post2040_global_growth_gw_per_year"]
-    )
-
-    # ── Load operating fleet with capacities ─────────────────────────────
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT reactor_id, region, status,
-               COALESCE(restart_capacity_mw, net_capacity_mw, 0) as cap_mw,
-               restart_date
-        FROM reactors
-        WHERE status IN ('Operating', 'LongTermShutdown', 'Restarted')
-    """)
-    operating_fleet = list(cur.fetchall())
-
-    # ── Apply what-if overrides (in-memory only, DB untouched) ───────────
-    if what_if_overrides:
-        reactor_overrides = {k: v for k, v in what_if_overrides.items()
-                             if k != "__synthetic__"}
-
-        # Retirement year overrides feed directly into the schedule
-        for rid, ov in reactor_overrides.items():
-            if "retirement_year" in ov:
-                retirement_schedule[rid] = ov["retirement_year"]
-
-        # Load any overridden reactors not currently in the operating fleet
-        # (e.g. PermanentShutdown units being restarted in the what-if).
-        # IMPORTANT: only fetch reactors that carry fleet-level overrides
-        # (restart_date / status / capacity_mw).  Reactors whose override is
-        # purely pipeline-level (pipeline_probability / expected_online_year)
-        # must NOT be pulled into the operating fleet — doing so would silently
-        # add them as full-capacity operating units and inflate capacity.
-        _FLEET_OVERRIDE_FIELDS = {"status", "capacity_mw", "restart_date"}
-        fleet_ids = {r[0] for r in operating_fleet}
-        extra_ids = [
-            rid for rid in reactor_overrides
-            if rid not in fleet_ids
-            and bool(_FLEET_OVERRIDE_FIELDS & reactor_overrides[rid].keys())
+    if state is not None:
+        # ── Fast path: use pre-built state ────────────────────────────────
+        params             = state.scenario_params
+        transition_year    = params.get("transition_year") or 2040
+        retirement_schedule = dict(state.retirement_schedule)  # defensive copy
+        pipeline           = list(state.pipeline)
+        adders             = state.region_adders
+        post2040_by_region = state.post2040_by_region
+        # Extract the (rid, region, status, cap_mw, restart_date) tuple format
+        # that the projection loop expects, from the richer state fleet dicts.
+        operating_fleet = [
+            (r["reactor_id"], r["region"], r["status"],
+             r["cap_mw"], r.get("restart_date"))
+            for r in state.fleet
         ]
-        if extra_ids:
-            placeholders = ",".join("?" * len(extra_ids))
-            cur.execute(f"""
-                SELECT reactor_id, region, status,
-                       COALESCE(restart_capacity_mw, net_capacity_mw, 0) as cap_mw,
-                       restart_date
-                FROM reactors WHERE reactor_id IN ({placeholders})
-            """, extra_ids)
-            operating_fleet.extend(cur.fetchall())
+    else:
+        # ── Standard path: build inputs from DB ───────────────────────────
+        params = get_scenario_params(conn, scenario_id)
+        transition_year = params.get("transition_year") or 2040
 
-        # Fleet overrides: status / capacity / restart_date
-        new_fleet = []
-        for (rid, reg, status, cap_mw, restart_date) in operating_fleet:
-            if rid in reactor_overrides:
-                ov = reactor_overrides[rid]
-                status       = ov.get("status",       status)
-                cap_mw       = ov.get("capacity_mw",  cap_mw)
-                restart_date = ov.get("restart_date", restart_date)
-            new_fleet.append((rid, reg, status, cap_mw, restart_date))
-        operating_fleet = new_fleet
+        retirement_schedule = build_retirement_schedule(conn, scenario_id)
+        pipeline            = build_pipeline(conn, scenario_id)
+        adders              = get_region_adders(conn, scenario_id)
+        post2040_by_region  = get_regional_post2040(
+            conn, scenario_id, params["post2040_global_growth_gw_per_year"]
+        )
 
-        # Pipeline overrides: adjust effective_online_year or probability
-        if any("expected_online_year" in v or "pipeline_probability" in v
-               for v in reactor_overrides.values()):
-            new_pipeline = []
-            for r in pipeline:
-                rid = r.get("reactor_id")
-                if rid and rid in reactor_overrides:
+        _cur = conn.cursor()
+        _cur.execute("""
+            SELECT reactor_id, region, status,
+                   COALESCE(restart_capacity_mw, net_capacity_mw, 0) as cap_mw,
+                   restart_date
+            FROM reactors
+            WHERE status IN ('Operating', 'LongTermShutdown', 'Restarted')
+        """)
+        operating_fleet = list(_cur.fetchall())
+
+        # ── Apply what-if overrides (in-memory only, DB untouched) ────────
+        if what_if_overrides:
+            reactor_overrides = {k: v for k, v in what_if_overrides.items()
+                                 if k != "__synthetic__"}
+
+            for rid, ov in reactor_overrides.items():
+                if "retirement_year" in ov:
+                    retirement_schedule[rid] = ov["retirement_year"]
+
+            # Only fetch fleet-level overridden non-fleet reactors.
+            # Pipeline-only overrides (pipeline_probability / expected_online_year)
+            # must NOT promote a reactor to the operating fleet.
+            _FLEET_OVERRIDE_FIELDS = {"status", "capacity_mw", "restart_date"}
+            fleet_ids = {r[0] for r in operating_fleet}
+            extra_ids = [
+                rid for rid in reactor_overrides
+                if rid not in fleet_ids
+                and bool(_FLEET_OVERRIDE_FIELDS & reactor_overrides[rid].keys())
+            ]
+            if extra_ids:
+                placeholders = ",".join("?" * len(extra_ids))
+                _cur.execute(f"""
+                    SELECT reactor_id, region, status,
+                           COALESCE(restart_capacity_mw, net_capacity_mw, 0) as cap_mw,
+                           restart_date
+                    FROM reactors WHERE reactor_id IN ({placeholders})
+                """, extra_ids)
+                operating_fleet.extend(_cur.fetchall())
+
+            new_fleet = []
+            for (rid, reg, status, cap_mw, restart_date) in operating_fleet:
+                if rid in reactor_overrides:
                     ov = reactor_overrides[rid]
-                    r = dict(r)
-                    if "expected_online_year" in ov:
-                        r["effective_online_year"] = int(ov["expected_online_year"])
-                    if "pipeline_probability" in ov:
-                        r["expected_capacity_mw"] = (
-                            r.get("net_capacity_mw", 0) * float(ov["pipeline_probability"])
-                        )
-                new_pipeline.append(r)
-            pipeline = new_pipeline
+                    status       = ov.get("status",       status)
+                    cap_mw       = ov.get("capacity_mw",  cap_mw)
+                    restart_date = ov.get("restart_date", restart_date)
+                new_fleet.append((rid, reg, status, cap_mw, restart_date))
+            operating_fleet = new_fleet
+
+            if any("expected_online_year" in v or "pipeline_probability" in v
+                   for v in reactor_overrides.values()):
+                new_pipeline = []
+                for r in pipeline:
+                    rid = r.get("reactor_id")
+                    if rid and rid in reactor_overrides:
+                        ov = reactor_overrides[rid]
+                        r = dict(r)
+                        if "expected_online_year" in ov:
+                            r["effective_online_year"] = int(ov["expected_online_year"])
+                        if "pipeline_probability" in ov:
+                            r["expected_capacity_mw"] = (
+                                r.get("net_capacity_mw", 0)
+                                * float(ov["pipeline_probability"])
+                            )
+                    new_pipeline.append(r)
+                pipeline = new_pipeline
 
     # Group pipeline by (region, online_year) — for per-year reporting
     pipeline_by_region_year: dict[tuple, float] = defaultdict(float)
@@ -189,7 +217,10 @@ def run_projection(
             pipeline_by_region_year[(reg, yr)] += mw
 
     # ── Inject synthetic new-build batches ────────────────────────────────
-    if what_if_overrides and "__synthetic__" in what_if_overrides:
+    # When state is provided, synthetic builds are already in state.pipeline
+    # and were grouped into pipeline_by_region_year above.  Only inject here
+    # for the legacy code path (state is None, raw overrides passed directly).
+    if state is None and what_if_overrides and "__synthetic__" in what_if_overrides:
         for batch in what_if_overrides["__synthetic__"]:
             reg      = batch.get("region")
             cap_mw   = float(batch.get("capacity_mw", 0))
@@ -350,8 +381,8 @@ def run_projection(
                 "is_bottom_up":             is_bottom_up,
             })
 
-    # ── Write to DB (skipped for what-if runs) ────────────────────────────
-    if write_to_db:
+    # ── Write to DB (skipped for what-if / state-based runs) ─────────────
+    if write_to_db and cur is not None:
         cur.executemany("""
             INSERT OR REPLACE INTO projections
             (scenario_id, year, region, capacity_operating_gw,

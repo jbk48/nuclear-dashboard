@@ -25,6 +25,7 @@ from model.api import (
     run_what_if_projection, run_what_if_all_regions, get_reactor_options,
     get_what_if_country_capacity,
 )
+from model.state import ProjectionState, build_projection_state
 from dashboard.charts import (
     chart1_global_projection,
     chart4_regional,
@@ -163,24 +164,51 @@ def _to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Data") -> bytes:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+def load_projection_state(
+    scenario_id: str,
+    what_if_overrides_json: str = "",
+) -> ProjectionState:
+    """
+    Cached wrapper for build_projection_state.
+
+    Uses a JSON string as the cache key (ProjectionState itself is not hashable
+    by st.cache_data).  Called once per (scenario_id, overrides) pair per session;
+    the result is shared by load_tech_projection and the country/map call sites.
+    """
+    wi_overrides = json.loads(what_if_overrides_json) if what_if_overrides_json else None
+    return build_projection_state(scenario_id, wi_overrides)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def load_tech_projection(
     scenario_id: str,
     regions_key: str,           # stringified tuple of regions — hashable cache key
     smr_post2040_share: float,
     smr_accel_start_year: int = 0,
     smr_accel_gw_per_year: float = 0.0,
-    what_if_overrides_json: str = "",   # JSON-serialised what_if_overrides dict
+    what_if_overrides_json: str = "",   # JSON-serialised overrides — also used as cache key
 ) -> pd.DataFrame:
-    """Cached wrapper for get_tech_projection."""
+    """
+    Cached wrapper for get_tech_projection.
+
+    When what_if_overrides_json is set, re-uses the already-cached
+    ProjectionState from load_projection_state so the DB and override
+    application happen at most once per (scenario, overrides) pair.
+    """
     regions = list(eval(regions_key)) if regions_key != "all" else None
-    wi_overrides = json.loads(what_if_overrides_json) if what_if_overrides_json else None
+    # Re-use cached state when overrides are active — avoids rebuilding state
+    state = (
+        load_projection_state(scenario_id, what_if_overrides_json)
+        if what_if_overrides_json else None
+    )
     return get_tech_projection(
         scenario_id=scenario_id,
         regions=regions,
         smr_post2040_share=smr_post2040_share,
         smr_accel_start_year=smr_accel_start_year,
         smr_accel_gw_per_year=smr_accel_gw_per_year,
-        what_if_overrides=wi_overrides,
+        what_if_overrides=None,   # never pass raw overrides — state handles them
+        state=state,
     )
 
 
@@ -670,6 +698,15 @@ _wi_active = (
     _wi_proj_all is not None
     and (bool(st.session_state.get("wi_overrides")) or bool(st.session_state.get("wi_synthetic")))
 )
+
+# Build a single ProjectionState for this render cycle when what-if is active.
+# All tabs (technology breakdown, country snapshot, world map) share this state
+# so DB reads and override application happen exactly once.
+_proj_state: ProjectionState | None = None
+if _wi_active:
+    _wi_ov_json_global = json.dumps(_build_wi_overrides_dict(), sort_keys=True)
+    _proj_state = load_projection_state(_active_db_id, _wi_ov_json_global)
+
 if _wi_active:
     _proj_source_dict = _wi_proj_all
     proj_global = _wi_proj_all.get("Global", proj_global)
@@ -978,9 +1015,6 @@ with tab2:
     else:
         # Technology breakdown
         _regions_key = str(tuple(sorted(sel_regions))) if geo_filtered else "all"
-        _wi_ov_json  = (
-            json.dumps(_build_wi_overrides_dict(), sort_keys=True) if _wi_active else ""
-        )
         with st.spinner("Computing technology breakdown…"):
             tech_df = load_tech_projection(
                 scenario_id=_active_db_id,
@@ -988,7 +1022,7 @@ with tab2:
                 smr_post2040_share=state.smr_post2040_share,
                 smr_accel_start_year=state.smr_accel_start_year if state.smr_accel_gw_per_year > 0 else 0,
                 smr_accel_gw_per_year=state.smr_accel_gw_per_year,
-                what_if_overrides_json=_wi_ov_json,
+                what_if_overrides_json=_wi_ov_json_global if _wi_active else "",
             )
         st.caption(
             "Post-2040 technology split is estimated: SMR share from the lever; "
@@ -1071,10 +1105,7 @@ with tab4:
     # pipeline (delay adder + realization rates) rather than raw reactor data.
     _tech_df_for_chart6: pd.DataFrame | None = None
     if split_by == "technology":
-        _regions_key_t3  = str(tuple(sorted(sel_regions))) if geo_filtered else "all"
-        _wi_ov_json_t3   = (
-            json.dumps(_build_wi_overrides_dict(), sort_keys=True) if _wi_active else ""
-        )
+        _regions_key_t3 = str(tuple(sorted(sel_regions))) if geo_filtered else "all"
         with st.spinner("Computing technology breakdown…"):
             _tech_df_for_chart6 = load_tech_projection(
                 scenario_id=_active_db_id,
@@ -1082,7 +1113,7 @@ with tab4:
                 smr_post2040_share=state.smr_post2040_share,
                 smr_accel_start_year=state.smr_accel_start_year if state.smr_accel_gw_per_year > 0 else 0,
                 smr_accel_gw_per_year=state.smr_accel_gw_per_year,
-                what_if_overrides_json=_wi_ov_json_t3,
+                what_if_overrides_json=_wi_ov_json_global if _wi_active else "",
             )
     # Warning: planned reactors with no announced construction date are excluded
     _no_date = reactors[
@@ -1171,10 +1202,9 @@ with tab5:
 
     with st.spinner("Loading country data…"):
         if _wi_active:
-            _wi_overrides_dict = _build_wi_overrides_dict()
             country_df = get_what_if_country_capacity(
                 year=snapshot_year, scenario_id=_active_db_id,
-                what_if_overrides=_wi_overrides_dict)
+                state=_proj_state)
         else:
             country_df = load_country_capacity(year=snapshot_year, scenario_id=_active_db_id)
 
@@ -1249,10 +1279,9 @@ with tab6:
 
     with st.spinner("Loading map data…"):
         if _wi_active:
-            _wi_overrides_dict = _build_wi_overrides_dict()
             map_country_df = get_what_if_country_capacity(
                 year=map_year, scenario_id=_active_db_id,
-                what_if_overrides=_wi_overrides_dict)
+                state=_proj_state)
         else:
             map_country_df = load_country_capacity(year=map_year, scenario_id=_active_db_id)
 
