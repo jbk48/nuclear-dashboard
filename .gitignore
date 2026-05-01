@@ -22,3 +22,10 @@ venv/
 
 # ── Streamlit secrets (never commit — set in Streamlit Cloud UI instead) ──
 .streamlit/secrets.toml
+
+# ── Data dev exports (pipeline data lives in nuclear.db) ──────────────────
+data/pipeline_*.xlsx
+data/pipeline_*.csv
+
+# ── Word / Office temp lock files ─────────────────────────────────────────
+docs/~$*
