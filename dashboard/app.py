@@ -5,41 +5,46 @@ Run with:
     cd nuclear-dashboard
     streamlit run dashboard/app.py
 """
-import streamlit as st
-import pandas as pd
-import io
 import json
 import sys
+import uuid
 from pathlib import Path
+
+import pandas as pd
+import streamlit as st
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-from config import REGIONS, DB_PATH, BASELINE_YEAR, PROJECTION_END_YEAR
-from model.api import (
-    get_projection, get_historical, get_benchmarks,
-    get_reactor_list, get_data_vintage_string,
-    write_and_run_custom_scenario, get_country_capacity,
-    get_full_reactor_download, cleanup_stale_custom_scenarios,
-    get_tech_projection, TECH_GROUPS,
-    run_what_if_projection, run_what_if_all_regions, get_reactor_options,
-    get_what_if_country_capacity,
+from config import REGIONS, BASELINE_YEAR, PROJECTION_END_YEAR
+from dashboard.levers import render_sidebar_panel
+
+from dashboard.cache import (
+    load_all_projections,
+    load_historical_all,
+    load_benchmarks,
+    load_reactors,
+    load_vintage,
+    load_full_reactor_download,
+    load_projection_state,
+    to_excel_bytes,
 )
-from model.state import ProjectionState, build_projection_state
-from dashboard.charts import (
-    chart1_global_projection,
-    chart4_regional,
-    chart4_technology,
-    chart5_retirements,
-    chart6_additions,
-    chart7_country_bar,
-    chart_map,
-    chart_what_if_diff,
+from dashboard.helpers import (
+    build_wi_overrides_dict,
+    sum_projections,
+    sum_historical,
+    gw_from_df,
+    build_scenario_export,
 )
-from dashboard.levers import (
-    render_lever_panel, render_sidebar_panel, render_lab_panel,
-    ScenarioState, PRESET_DEFAULTS,
-    LARGE_PIPELINE_PRESETS, SMR_PIPELINE_PRESETS,
+from dashboard.tab_renderers import (
+    RenderContext,
+    render_tab1_global,
+    render_tab2_breakdown,
+    render_tab3_retirements,
+    render_tab4_additions,
+    render_tab5_country,
+    render_tab6_map,
+    render_tab7_lab,
 )
 
 # ── Page config ────────────────────────────────────────────────────────────
@@ -49,6 +54,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
 
 # ── Password gate ─────────────────────────────────────────────────────────
 def _check_password() -> bool:
@@ -66,10 +72,44 @@ def _check_password() -> bool:
             st.rerun()
         else:
             st.error("Incorrect password — please try again.")
+    st.markdown("---")
+    st.markdown("""
+An interactive scenario modeling tool for global nuclear power capacity from 2024 to 2050,
+built on unit-level reactor data from IAEA PRIS. Charts are scenario outputs, not forecasts —
+they reflect the assumptions you configure. *For research and educational use only.*
+
+**Four default scenarios are included for reference:**
+- **Decline** — no new life extensions; US/Japan fleet retires on current licenses; conservative pipeline
+- **Conservative** — modest extensions; only under-construction reactors included in pipeline
+- **Base** *(default)* — current country-specific extension policies; medium pipeline realization
+- **Optimistic** — broad life extensions; high pipeline realization including proposed projects
+
+**Seven tabs offer a range of data breakdowns and customization options:**
+- 📈 **Global Projection** — total capacity 2005–2050 with benchmark overlays (IAEA, IEA)
+- 📊 **Capacity Breakdown** — stacked by region or technology
+- 📉 **Retirements** — which reactors retire and when
+- ➕ **New Additions** — pipeline funnel and construction timelines
+- 🏳️ **Country Snapshot** — per-country capacity at a chosen year
+- 🗺️ **World Map** — geographic view of the operating fleet
+- 🔬 **Scenario Lab** — build a custom scenario and see the delta vs the preset
+
+**Use the Scenario Lab to model detailed assumptions and what-ifs:**
+Adjust levers (life extension policy, pipeline rates, SMR deployment, post-2040 growth) and
+click **▶ Apply Scenario** to recompute. Use the **What-If** panel to override individual
+reactors or add synthetic new-build batches. A built-in Claude assistant can generate overrides
+from plain-language descriptions (e.g. *"retire all Canadian reactors in 2033"*).
+
+**Other notes**
+- Most charts have a **⬇ Data** download button for the underlying numbers
+- The sidebar **Download Scenario + Settings** exports a 4-sheet Excel with your full lever configuration
+- The geography filter (sidebar) restricts all charts and KPIs to selected regions
+- Post-2040 projections switch to a top-down growth-rate model; treat those years as directional only
+""")
     return False
 
 if not _check_password():
     st.stop()
+
 
 # ── Custom CSS: widen sidebar to ~35% ─────────────────────────────────────
 st.markdown("""
@@ -92,647 +132,98 @@ st.markdown("""
 # Each browser session gets its own unique custom-scenario ID so concurrent
 # users never overwrite each other's DB rows.
 if "_custom_scenario_id" not in st.session_state:
-    import uuid
+    from model.api import cleanup_stale_custom_scenarios
     st.session_state["_custom_scenario_id"] = f"custom_{uuid.uuid4().hex[:8]}"
-    # Run cleanup once per new session (background hygiene — delete stale rows)
     cleanup_stale_custom_scenarios(max_age_hours=2)
 
 _SESSION_CUSTOM_ID: str = st.session_state["_custom_scenario_id"]
 
 
-# ── Data loading (cached) ──────────────────────────────────────────────────
-
-@st.cache_data(ttl=300)
-def load_all_projections() -> dict[str, dict[str, pd.DataFrame]]:
-    scenario_ids = ["decline", "conservative", "base", "optimistic"]
-    result = {}
-    for sc_id in scenario_ids:
-        result[sc_id] = {}
-        for region in REGIONS + ["Global"]:
-            result[sc_id][region] = get_projection(scenario_id=sc_id, region=region)
-    return result
-
-
-@st.cache_data(ttl=300)
-def load_historical_all() -> dict[str, pd.DataFrame]:
-    result = {}
-    for region in REGIONS + ["Global"]:
-        result[region] = get_historical(region=region)
-    return result
-
-
-@st.cache_data(ttl=300)
-def load_benchmarks() -> pd.DataFrame:
-    return get_benchmarks(region="Global")
-
-
-@st.cache_data(ttl=300)
-def load_reactors() -> pd.DataFrame:
-    return get_reactor_list()
-
-
-@st.cache_data(ttl=600)
-def load_vintage() -> str:
-    return get_data_vintage_string()
-
-
-@st.cache_data(ttl=600)
-def load_full_reactor_download() -> pd.DataFrame:
-    return get_full_reactor_download()
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def _to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Data") -> bytes:
-    """Convert a DataFrame to Excel bytes suitable for st.download_button.
-    Cached so repeated re-runs (slider moves, tab switches) don't regenerate the file."""
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name=sheet_name)
-        ws = writer.sheets[sheet_name]
-        from openpyxl.styles import Font, PatternFill, Alignment
-        hdr_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
-        hdr_font = Font(color="FFFFFF", bold=True)
-        for cell in ws[1]:
-            cell.fill = hdr_fill
-            cell.font = hdr_font
-            cell.alignment = Alignment(horizontal="center")
-        for col in ws.columns:
-            max_len = max(len(str(cell.value or "")) for cell in col)
-            ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 50)
-        ws.freeze_panes = "A2"
-    return buf.getvalue()
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def load_projection_state(
-    scenario_id: str,
-    what_if_overrides_json: str = "",
-) -> ProjectionState:
-    """
-    Cached wrapper for build_projection_state.
-
-    Uses a JSON string as the cache key (ProjectionState itself is not hashable
-    by st.cache_data).  Called once per (scenario_id, overrides) pair per session;
-    the result is shared by load_tech_projection and the country/map call sites.
-    """
-    wi_overrides = json.loads(what_if_overrides_json) if what_if_overrides_json else None
-    return build_projection_state(scenario_id, wi_overrides)
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def load_tech_projection(
-    scenario_id: str,
-    regions_key: str,           # stringified tuple of regions — hashable cache key
-    smr_post2040_share: float,
-    smr_accel_start_year: int = 0,
-    smr_accel_gw_per_year: float = 0.0,
-    what_if_overrides_json: str = "",   # JSON-serialised overrides — also used as cache key
-) -> pd.DataFrame:
-    """
-    Cached wrapper for get_tech_projection.
-
-    When what_if_overrides_json is set, re-uses the already-cached
-    ProjectionState from load_projection_state so the DB and override
-    application happen at most once per (scenario, overrides) pair.
-    """
-    regions = list(eval(regions_key)) if regions_key != "all" else None
-    # Re-use cached state when overrides are active — avoids rebuilding state
-    state = (
-        load_projection_state(scenario_id, what_if_overrides_json)
-        if what_if_overrides_json else None
-    )
-    return get_tech_projection(
-        scenario_id=scenario_id,
-        regions=regions,
-        smr_post2040_share=smr_post2040_share,
-        smr_accel_start_year=smr_accel_start_year,
-        smr_accel_gw_per_year=smr_accel_gw_per_year,
-        what_if_overrides=None,   # never pass raw overrides — state handles them
-        state=state,
-    )
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def load_country_capacity(year: int, scenario_id: str) -> pd.DataFrame:
-    """Cached wrapper for get_country_capacity — avoids rebuilding retirement
-    schedules and pipeline on every slider drag."""
-    return get_country_capacity(year=year, scenario_id=scenario_id)
-
-
-# ── Scenario export ───────────────────────────────────────────────────────
-
-def _build_scenario_export(
-    state: "ScenarioState",
-    active_key: str,
-    proj_global: pd.DataFrame,
-    proj_by_region: dict,
-) -> bytes:
-    """
-    Build a multi-sheet Excel export for the current scenario:
-      Sheet 1 — Scenario Settings  (all lever values, fully reproducible)
-      Sheet 2 — Global Projection  (year-by-year global totals)
-      Sheet 3 — Regional Breakdown (year-by-year per region)
-      Sheet 4 — About              (model description + disclaimer)
-    """
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    from openpyxl.utils import get_column_letter
-    from datetime import date as _date
-
-    buf = io.BytesIO()
-
-    # ── Helper: style a worksheet header row ──────────────────────────────
-    def _style_sheet(ws, header_color="1F4E79"):
-        hdr_fill = PatternFill(start_color=header_color, end_color=header_color,
-                               fill_type="solid")
-        hdr_font = Font(color="FFFFFF", bold=True)
-        for cell in ws[1]:
-            cell.fill = hdr_fill
-            cell.font = hdr_font
-            cell.alignment = Alignment(horizontal="center")
-        for col in ws.columns:
-            max_len = max((len(str(cell.value or "")) for cell in col), default=8)
-            ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 60)
-        ws.freeze_panes = "A2"
-
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-
-        # ── Sheet 1: Scenario Settings ────────────────────────────────────
-        ext_labels = {
-            "None":           "None — retire at baseline date",
-            "HistoricalRate": "Historical Rate (~50% of fleet extended)",
-            "Moderate":       "Moderate (~75% of fleet extended)",
-            "MaximumAllowed": "Maximum Allowed (100%, max regulatory life)",
-        }
-        pipeline_desc = {
-            "high":   "High — UC + Planned + Proposed all complete",
-            "medium": "Medium — UC + Planned complete; Proposed excluded",
-            "low":    "Low — Under Construction only",
-        }
-        settings_rows = [
-            ("Scenario",                  active_key.title()),
-            ("Export date",               str(_date.today())),
-            ("",                          ""),
-            ("── Life Extensions",        ""),
-            ("Extension policy",          ext_labels.get(state.extension_policy_global,
-                                                          state.extension_policy_global)),
-            ("",                          ""),
-            ("── Pipeline Realization",   ""),
-            ("Large reactor preset",      pipeline_desc.get(state.large_pipeline_preset,
-                                                             state.large_pipeline_preset)),
-            ("  Under Construction rate", f"{state.pipeline_uc_rate*100:.0f}%"),
-            ("  Planned rate",            f"{state.pipeline_planned_rate*100:.0f}%"),
-            ("  Proposed rate",           f"{state.pipeline_proposed_rate*100:.0f}%"),
-            ("SMR pipeline preset",       pipeline_desc.get(state.smr_pipeline_preset,
-                                                             state.smr_pipeline_preset)),
-            ("  SMR Under Construction",  f"{state.smr_uc_rate*100:.0f}%"),
-            ("  SMR Planned",             f"{state.smr_planned_rate*100:.0f}%"),
-            ("  SMR Proposed",            f"{state.smr_proposed_rate*100:.0f}%"),
-            ("Construction delay adder",  f"+{state.construction_delay_adder:.0f} years"),
-            ("",                          ""),
-            ("── SMR Deployment",         ""),
-            ("Pre-2040 SMR acceleration", f"{state.smr_accel_gw_per_year:.1f} GW/yr"
-                                          + (f" from {state.smr_accel_start_year}"
-                                             if state.smr_accel_gw_per_year > 0 else " (none)")),
-            ("Post-2040 SMR share",       f"{state.smr_post2040_share*100:.0f}%"),
-            ("",                          ""),
-            ("── Post-2040 New Build",    ""),
-            ("Global new build rate",     f"{state.post2040_global_growth_gw:.1f} GW/yr"),
-            ("China share",               f"{state.china_post2040_gw:.1f} GW/yr"),
-            ("Rest-of-world share",
-             f"{max(0.0, state.post2040_global_growth_gw - state.china_post2040_gw):.1f} GW/yr"),
-        ]
-        df_settings = pd.DataFrame(settings_rows, columns=["Setting", "Value"])
-        df_settings.to_excel(writer, index=False, sheet_name="Scenario Settings")
-        ws_s = writer.sheets["Scenario Settings"]
-        _style_sheet(ws_s, header_color="1F4E79")
-        # Bold section headers (rows where Value is empty and Setting starts with ──)
-        for row in ws_s.iter_rows(min_row=2):
-            if str(row[0].value or "").startswith("──"):
-                for cell in row:
-                    cell.font = Font(bold=True, color="1F4E79")
-
-        # ── Sheet 2: Global Projection ────────────────────────────────────
-        _base_cols = ["year", "capacity_operating_gw",
-                      "retirements_this_year_gw", "additions_this_year_gw", "is_bottom_up"]
-        _ytd_cols  = ["capacity_retired_ytd_gw", "capacity_added_ytd_gw"]
-        _avail_ytd = [c for c in _ytd_cols if c in proj_global.columns]
-        df_global = proj_global[_base_cols[:4] + _avail_ytd + _base_cols[4:]].copy()
-        _col_names = ["Year", "Capacity (GW)", "Retirements (GW/yr)", "Additions (GW/yr)"]
-        if "capacity_retired_ytd_gw" in _avail_ytd:
-            _col_names.append("Cumul. Retired (GW)")
-        if "capacity_added_ytd_gw" in _avail_ytd:
-            _col_names.append("Cumul. Added (GW)")
-        _col_names.append("Bottom-Up Phase")
-        df_global.columns = _col_names
-        df_global["Capacity (GW)"] = df_global["Capacity (GW)"].round(2)
-        df_global["Retirements (GW/yr)"] = df_global["Retirements (GW/yr)"].round(3)
-        df_global["Additions (GW/yr)"] = df_global["Additions (GW/yr)"].round(3)
-        if "Cumul. Retired (GW)" in df_global.columns:
-            df_global["Cumul. Retired (GW)"] = df_global["Cumul. Retired (GW)"].round(2)
-        if "Cumul. Added (GW)" in df_global.columns:
-            df_global["Cumul. Added (GW)"] = df_global["Cumul. Added (GW)"].round(2)
-        df_global["Bottom-Up Phase"] = df_global["Bottom-Up Phase"].map({1: "Yes", 0: "No"})
-        df_global.to_excel(writer, index=False, sheet_name="Global Projection")
-        _style_sheet(writer.sheets["Global Projection"])
-
-        # ── Sheet 3: Regional Breakdown ───────────────────────────────────
-        regional_rows = []
-        for region, df_r in proj_by_region.items():
-            if df_r.empty:
-                continue
-            for _, row in df_r.iterrows():
-                regional_rows.append({
-                    "Region":               region,
-                    "Year":                 int(row["year"]),
-                    "Capacity (GW)":        round(float(row["capacity_operating_gw"]), 2),
-                    "Retirements (GW/yr)":  round(float(row["retirements_this_year_gw"]), 3),
-                    "Additions (GW/yr)":    round(float(row["additions_this_year_gw"]), 3),
-                    "Bottom-Up Phase":      "Yes" if row["is_bottom_up"] else "No",
-                })
-        df_regional = pd.DataFrame(regional_rows)
-        if not df_regional.empty:
-            df_regional.to_excel(writer, index=False, sheet_name="Regional Breakdown")
-            _style_sheet(writer.sheets["Regional Breakdown"])
-
-        # ── Sheet 4: About ────────────────────────────────────────────────
-        about_rows = [
-            ("Nuclear Capacity Dashboard — Scenario Export", ""),
-            ("", ""),
-            ("Generated", str(_date.today())),
-            ("Scenario", active_key.title()),
-            ("", ""),
-            ("Model overview", ""),
-            ("Phase 1 (2024–2040)", "Bottom-up unit-level simulation. Each reactor tracked individually."),
-            ("Phase 2 (2040–2050)", "Top-down growth bridge. New build driven by GW/yr rate; unit retirements continue."),
-            ("", ""),
-            ("Data sources", ""),
-            ("Reactor data", "IAEA PRIS (© IAEA) — operating fleet, commissioning & retirement dates"),
-            ("Pipeline data", "WNA Reactor Database (© WNA) — under construction, planned, proposed units"),
-            ("Benchmarks", "IAEA RDS-1 2025 (Low/High) · IEA WEO 2024 (STEPS/APS/Low Nuclear)"),
-            ("Historical capacity", "IAEA RDS-2 (2005–2023)"),
-            ("", ""),
-            ("Disclaimer", ""),
-            ("", "These projections are scenario outputs, not forecasts. They reflect the"),
-            ("", "assumptions set by the user and should not be used as the basis for"),
-            ("", "investment, policy, or engineering decisions without independent verification."),
-        ]
-        df_about = pd.DataFrame(about_rows, columns=["Field", "Detail"])
-        df_about.to_excel(writer, index=False, sheet_name="About")
-        ws_a = writer.sheets["About"]
-        _style_sheet(ws_a, header_color="2e7d32")
-        # Bold the section labels
-        for row in ws_a.iter_rows(min_row=2):
-            val = str(row[0].value or "")
-            if val and not val.startswith(" ") and row[1].value == "":
-                row[0].font = Font(bold=True)
-
-    return buf.getvalue()
-
-
-# ── What-if override dict builder ────────────────────────────────────────
-def _build_wi_overrides_dict() -> dict:
-    """Rebuild the what_if_overrides dict from session state for API calls."""
-    ov_dict: dict = {}
-    for o in st.session_state.get("wi_overrides", []):
-        rid = o["reactor_id"]
-        if rid not in ov_dict:
-            ov_dict[rid] = {}
-        ov_dict[rid][o["field"]] = o["value"]
-    if st.session_state.get("wi_synthetic"):
-        ov_dict["__synthetic__"] = st.session_state["wi_synthetic"]
-    return ov_dict
-
-
-# ── Geography-aware aggregation helpers ───────────────────────────────────
-
-def _sum_projections(proj_dict: dict, regions: list) -> pd.DataFrame:
-    """Sum per-region projection DataFrames across the given regions.
-    Uses year-based groupby so misaligned or differently-sized DataFrames
-    cannot cause silent positional errors."""
-    sum_cols = [
-        "capacity_operating_gw", "retirements_this_year_gw", "additions_this_year_gw",
-        "capacity_retired_ytd_gw", "capacity_added_ytd_gw",
-    ]
-    # Only include columns that actually exist in the region DataFrames
-    sample = next((proj_dict[r] for r in regions if r in proj_dict and not proj_dict[r].empty), None)
-    if sample is None:
-        return pd.DataFrame()
-    available_sum_cols = [c for c in sum_cols if c in sample.columns]
-    dfs = [proj_dict[r][["year", "is_bottom_up"] + available_sum_cols]
-           for r in regions if r in proj_dict and not proj_dict[r].empty]
-    if not dfs:
-        return pd.DataFrame()
-    combined = pd.concat(dfs)
-    # is_bottom_up is identical across regions for any given year — take max (1 > 0)
-    ib = combined.groupby("year")["is_bottom_up"].max().reset_index()
-    summed = combined.groupby("year")[available_sum_cols].sum().reset_index()
-    return summed.merge(ib, on="year")
-
-
-def _sum_historical(hist_dict: dict, regions: list) -> pd.DataFrame:
-    """Sum per-region historical DataFrames across the given regions."""
-    dfs = [hist_dict[r][["year", "capacity_gw"]]
-           for r in regions if r in hist_dict and not hist_dict[r].empty]
-    if not dfs:
-        return pd.DataFrame()
-    return pd.concat(dfs).groupby("year")["capacity_gw"].sum().reset_index()
-
-
 # ── Sidebar lever panel ────────────────────────────────────────────────────
 state, _ = render_sidebar_panel()
 
-# ── Load data ──────────────────────────────────────────────────────────────
-all_projections = load_all_projections()
-historical_all = load_historical_all()
-benchmarks = load_benchmarks()
-reactors = load_reactors()
-vintage = load_vintage()
+# ── Load cached data ───────────────────────────────────────────────────────
+all_projections  = load_all_projections()
+historical_all   = load_historical_all()
+benchmarks       = load_benchmarks()
+reactors         = load_reactors()
+vintage          = load_vintage()
 
 sc_id = state.scenario_id
 
-# ── Custom lever recomputation ─────────────────────────────────────────────
-# Lever recomputation now happens inside the Scenario Lab tab when the user
-# clicks "▶ Apply Scenario". This block keeps the helper functions and reads
-# any existing custom projection from session state.
-# smr_post2040_share is stored as integer percent in levers.py; convert to float fraction here.
-_preset_defaults = {
-    k: {**v, "smr_post2040_share": v["smr_post2040_share"] / 100.0}
-    for k, v in PRESET_DEFAULTS.items()
-}
 
-def _levers_match_preset(state: ScenarioState, preset_id: str) -> bool:
-    pd_ = _preset_defaults.get(preset_id, {})
-    return (
-        state.extension_policy_global == pd_.get("extension_policy_global") and
-        state.large_pipeline_preset == pd_.get("large_pipeline_preset") and
-        state.smr_pipeline_preset == pd_.get("smr_pipeline_preset") and
-        abs(state.construction_delay_adder - pd_.get("construction_delay_adder", 0)) < 0.01 and
-        # acceleration: only check rate (if rate=0, start year is irrelevant)
-        abs(state.smr_accel_gw_per_year - pd_.get("smr_accel_gw_per_year", 0)) < 0.01 and
-        abs(state.smr_post2040_share - pd_.get("smr_post2040_share", 0.20)) < 0.01 and
-        abs(state.post2040_global_growth_gw - pd_.get("post2040_global_growth_gw", 0)) < 0.1 and
-        abs(state.china_post2040_gw - pd_.get("china_post2040_gw", 0)) < 0.1
-    )
-
-def _build_scenario_bullets(
-    state: "ScenarioState",
-    sc_id: str,
-    wi_overrides: list,
-    wi_synthetic: list,
-) -> list[str]:
-    """
-    Generate brief directional impact bullets for the Scenario Lab diff panel.
-    Compares the current ScenarioState against the starting preset (sc_id),
-    then summarises any reactor overrides and synthetic builds.
-    ⬆️ = growth driver / accelerator   ⬇️ = downward pressure / delayer
-    """
-    bullets: list[str] = []
-    pd_ = PRESET_DEFAULTS.get(sc_id, PRESET_DEFAULTS["base"])
-
-    # ── Life extension policy ────────────────────────────────────────────────
-    ext_def  = pd_.get("extension_policy_global", "CurrentPolicy")
-    ext_curr = state.extension_policy_global
-    if ext_curr != ext_def:
-        _ext_map = {
-            "ExtendedOperations":   ("⬆️", "Extended Operations — all reactors run to regulatory max life, expanding the operating fleet"),
-            "AcceleratedRetirement":("⬇️", "Accelerated Retirement — no new licence extensions, fleet declines faster"),
-            "CurrentPolicy":        ("➡️", "Current Policy — reverted to country-specific licensing rules"),
-        }
-        arrow, desc = _ext_map.get(ext_curr, ("~", ext_curr))
-        bullets.append(f"{arrow} **Reactor life extension**: {desc}")
-
-    # ── Large reactor pipeline realization ───────────────────────────────────
-    lpp     = LARGE_PIPELINE_PRESETS[pd_.get("large_pipeline_preset", "medium")]
-    luc_def = int(lpp["uc_rate"]       * 100)
-    lpl_def = int(lpp["planned_rate"]  * 100)
-    lpr_def = int(lpp["proposed_rate"] * 100)
-    luc_cur = int(state.pipeline_uc_rate       * 100)
-    lpl_cur = int(state.pipeline_planned_rate  * 100)
-    lpr_cur = int(state.pipeline_proposed_rate * 100)
-    if luc_cur != luc_def or lpl_cur != lpl_def or lpr_cur != lpr_def:
-        score = (luc_cur - luc_def) + (lpl_cur - lpl_def) + (lpr_cur - lpr_def)
-        arrow = "⬆️" if score > 0 else "⬇️"
-        bullets.append(
-            f"{arrow} **Large reactor pipeline**: UC {luc_cur}% / Planned {lpl_cur}% / Proposed {lpr_cur}%"
-            f" (default {luc_def}% / {lpl_def}% / {lpr_def}%)"
-        )
-
-    # ── SMR pipeline realization ─────────────────────────────────────────────
-    spp     = SMR_PIPELINE_PRESETS[pd_.get("smr_pipeline_preset", "medium")]
-    suc_def = int(spp["uc_rate"]       * 100)
-    spl_def = int(spp["planned_rate"]  * 100)
-    spr_def = int(spp["proposed_rate"] * 100)
-    suc_cur = int(state.smr_uc_rate       * 100)
-    spl_cur = int(state.smr_planned_rate  * 100)
-    spr_cur = int(state.smr_proposed_rate * 100)
-    if suc_cur != suc_def or spl_cur != spl_def or spr_cur != spr_def:
-        score = (suc_cur - suc_def) + (spl_cur - spl_def) + (spr_cur - spr_def)
-        arrow = "⬆️" if score > 0 else "⬇️"
-        bullets.append(
-            f"{arrow} **SMR pipeline**: UC {suc_cur}% / Planned {spl_cur}% / Proposed {spr_cur}%"
-            f" (default {suc_def}% / {spl_def}% / {spr_def}%)"
-        )
-
-    # ── Construction delay ───────────────────────────────────────────────────
-    delay_def = pd_.get("construction_delay_adder", 0)
-    delay_cur = state.construction_delay_adder
-    if abs(delay_cur - delay_def) >= 0.5:
-        if delay_cur > delay_def:
-            bullets.append(
-                f"⬇️ **Construction delay**: +{delay_cur:.0f} yr"
-                f" (default +{delay_def:.0f} yr) — all pipeline additions pushed back"
-            )
-        else:
-            bullets.append(
-                f"⬆️ **Construction delay**: +{delay_cur:.0f} yr"
-                f" (default +{delay_def:.0f} yr) — pipeline additions pulled forward"
-            )
-
-    # ── SMR pre-2040 acceleration ────────────────────────────────────────────
-    accel_def = float(pd_.get("smr_accel_gw_per_year", 0))
-    accel_cur = state.smr_accel_gw_per_year
-    if accel_cur > max(accel_def, 0.05):
-        bullets.append(
-            f"⬆️ **SMR pre-2040 acceleration**: +{accel_cur:.1f} GW/yr"
-            f" from {state.smr_accel_start_year} — extra SMR capacity above announced pipeline"
-        )
-    elif accel_def > 0.05 and accel_cur < accel_def - 0.05:
-        bullets.append(
-            f"⬇️ **SMR acceleration reduced**: {accel_cur:.1f} GW/yr (default {accel_def:.1f})"
-        )
-
-    # ── Post-2040 global new build ───────────────────────────────────────────
-    p40_def = float(pd_.get("post2040_global_growth_gw", 28.1))
-    p40_cur = state.post2040_global_growth_gw
-    if abs(p40_cur - p40_def) > 0.5:
-        if p40_cur > p40_def:
-            bullets.append(
-                f"⬆️ **Post-2040 new build**: {p40_cur:.1f} GW/yr"
-                f" (default {p40_def:.1f}) — higher long-run capacity growth"
-            )
-        else:
-            bullets.append(
-                f"⬇️ **Post-2040 new build**: {p40_cur:.1f} GW/yr"
-                f" (default {p40_def:.1f}) — lower long-run capacity growth"
-            )
-
-    # ── China post-2040 share ────────────────────────────────────────────────
-    china_def = float(pd_.get("china_post2040_gw", 8.0))
-    china_cur = state.china_post2040_gw
-    if abs(china_cur - china_def) > 0.5:
-        arrow = "⬆️" if china_cur > china_def else "⬇️"
-        bullets.append(
-            f"{arrow} **China post-2040 share**: {china_cur:.1f} GW/yr"
-            f" (default {china_def:.1f}) — shifts regional mix"
-        )
-
-    # ── Reactor overrides ────────────────────────────────────────────────────
-    if wi_overrides:
-        cancelled   = [o for o in wi_overrides
-                       if o["field"] == "pipeline_probability" and float(o["value"]) < 0.1]
-        confirmed   = [o for o in wi_overrides
-                       if o["field"] == "pipeline_probability" and float(o["value"]) >= 0.9]
-        ret_changes = [o for o in wi_overrides if o["field"] == "retirement_year"]
-        restarts    = [o for o in wi_overrides if o["field"] == "restart_date"]
-        cap_changes = [o for o in wi_overrides if o["field"] == "capacity_mw"]
-        other_ov    = [o for o in wi_overrides
-                       if o["field"] not in
-                       {"pipeline_probability", "retirement_year", "restart_date", "capacity_mw"}]
-
-        if cancelled:
-            bullets.append(
-                f"⬇️ **{len(cancelled)} pipeline reactor(s) cancelled**"
-                " — probability → 0, removing those additions from the projection"
-            )
-        if confirmed:
-            bullets.append(
-                f"⬆️ **{len(confirmed)} pipeline reactor(s) confirmed**"
-                " — probability → 1, locking in those additions"
-            )
-        if ret_changes:
-            yrs = [float(o["value"]) for o in ret_changes]
-            avg_yr = sum(yrs) / len(yrs)
-            if avg_yr >= 2045:
-                bullets.append(
-                    f"⬆️ **{len(ret_changes)} reactor life extension(s)**"
-                    f" — retirement year avg ~{avg_yr:.0f}, fleet lives longer"
-                )
-            elif avg_yr <= 2034:
-                bullets.append(
-                    f"⬇️ **{len(ret_changes)} early retirement(s)**"
-                    f" — closure year avg ~{avg_yr:.0f}, capacity removed sooner"
-                )
-            else:
-                bullets.append(
-                    f"~ **{len(ret_changes)} retirement year adjustment(s)**"
-                    f" — avg target ~{avg_yr:.0f}"
-                )
-        if restarts:
-            bullets.append(
-                f"⬆️ **{len(restarts)} reactor restart(s)**"
-                " — previously shutdown units returned to service"
-            )
-        if cap_changes:
-            bullets.append(
-                f"~ **{len(cap_changes)} reactor capacity adjustment(s)**"
-                " — net rating changed on specific units"
-            )
-        if other_ov:
-            bullets.append(f"~ **{len(other_ov)} other reactor override(s)**")
-
-    # ── Synthetic new builds ─────────────────────────────────────────────────
-    for sb in wi_synthetic:
-        gw_yr = sb["capacity_mw"] * sb["per_year"] / 1000
-        bullets.append(
-            f"⬆️ **Synthetic build**: {sb['per_year']} × {int(sb['capacity_mw'])} MW/yr"
-            f" in **{sb['region']}** from {sb['start_year']}"
-            f" for {sb['n_years']} yr (+{gw_yr:.1f} GW/yr)"
-        )
-
-    return bullets
-
-
+# ── Custom projection from session state ──────────────────────────────────
 custom_projection: dict | None = st.session_state.get("_custom_projection")
 
-# Clear custom if user switched presets (even without clicking Apply in the Lab)
+# Clear custom if the user switched presets without clicking Apply in the Lab
 if st.session_state.get("_custom_for_scenario") != sc_id:
     st.session_state.pop("_custom_projection", None)
     custom_projection = None
 
-# Use custom projection if available, else precomputed
 if custom_projection is not None:
-    proj_global = custom_projection["Global"]
-    _proj_source = "Custom"
-    # DB scenario ID for queries that go back to the database (e.g. country capacity)
     _active_db_id = _SESSION_CUSTOM_ID
 else:
-    proj_global = all_projections[sc_id]["Global"]
-    _proj_source = sc_id
     _active_db_id = sc_id
 
-hist_global = historical_all["Global"]
+active_key = "custom" if custom_projection is not None else sc_id
 
-# Geography filter: use state.selected_regions
+
+# ── Geography filter ───────────────────────────────────────────────────────
 sel_regions = [r for r in REGIONS if r in state.selected_regions]
 if not sel_regions:
     sel_regions = list(REGIONS)
-geo_filtered = len(sel_regions) < len(REGIONS)
+geo_filtered      = len(sel_regions) < len(REGIONS)
+filtered_reactors = reactors[reactors["region"].isin(sel_regions)] if geo_filtered else reactors
 
-# Per-region projections and historical (already filtered to sel_regions)
-_proj_source_dict = custom_projection if custom_projection is not None else all_projections[sc_id]
 
-# Pre-customisation baseline for the Scenario Lab diff chart.
-# Always use the raw preset projection (all_projections[sc_id]) so the chart
-# compares the preset starting-point against whatever the user has built —
-# whether that's lever-only changes, what-if overrides, or both.
-# Using custom_projection here would make both sides identical when only levers
-# change (custom_projection == proj_global_display → delta = 0 everywhere).
-_lab_base_global = (
-    _sum_projections(all_projections[sc_id], sel_regions) if geo_filtered
-    else all_projections[sc_id].get("Global", pd.DataFrame())
-)
-
-# ── What-if substitution: if a what-if has been run, override all chart data ──
+# ── What-if state ──────────────────────────────────────────────────────────
 _wi_proj_all = st.session_state.get("wi_proj_all")
-_wi_active = (
+_wi_active   = (
     _wi_proj_all is not None
     and (bool(st.session_state.get("wi_overrides")) or bool(st.session_state.get("wi_synthetic")))
 )
 
-# Build a single ProjectionState for this render cycle when what-if is active.
-# All tabs (technology breakdown, country snapshot, world map) share this state
-# so DB reads and override application happen exactly once.
-_proj_state: ProjectionState | None = None
-if _wi_active:
-    _wi_ov_json_global = json.dumps(_build_wi_overrides_dict(), sort_keys=True)
-    _proj_state = load_projection_state(_active_db_id, _wi_ov_json_global)
+# Build override JSON once; used as cache key and passed into RenderContext.
+_wi_ov_json = (
+    json.dumps(build_wi_overrides_dict(), sort_keys=True) if _wi_active else ""
+)
 
-if _wi_active:
-    _proj_source_dict = _wi_proj_all
-    proj_global = _wi_proj_all.get("Global", proj_global)
+# Build a single ProjectionState for this render cycle when what-if is active.
+# All tabs share this instance so DB reads happen at most once per cycle.
+_proj_state = load_projection_state(_active_db_id, _wi_ov_json) if _wi_active else None
+
+
+# ── Projection source selection ────────────────────────────────────────────
+_proj_source_dict = (
+    _wi_proj_all          if _wi_active              else
+    custom_projection     if custom_projection is not None else
+    all_projections[sc_id]
+)
+
+proj_global_display = (
+    sum_projections(_proj_source_dict, sel_regions) if geo_filtered
+    else _proj_source_dict.get("Global", all_projections[sc_id]["Global"])
+)
+hist_global_display = (
+    sum_historical(historical_all, sel_regions) if geo_filtered
+    else historical_all["Global"]
+)
 
 proj_by_region = {r: _proj_source_dict[r] for r in sel_regions if r in _proj_source_dict}
-hist_by_region = {r: historical_all[r] for r in sel_regions if r in historical_all}
+hist_by_region = {r: historical_all[r]    for r in sel_regions if r in historical_all}
 
-# Reactors filtered to selected regions (for pipeline funnel + fleet metrics)
-filtered_reactors = reactors[reactors["region"].isin(sel_regions)] if geo_filtered else reactors
+# Pre-customisation baseline for the Scenario Lab diff chart.
+# Always the raw preset projection so the diff shows the delta from the preset,
+# not from a previous custom run.
+_lab_base_global = (
+    sum_projections(all_projections[sc_id], sel_regions) if geo_filtered
+    else all_projections[sc_id].get("Global", pd.DataFrame())
+)
 
-# Geography-aware global view:
-# When filter is active, sum the selected-region projections/historical;
-# otherwise use the pre-aggregated Global row (faster, exact).
-if geo_filtered:
-    proj_global_display = _sum_projections(_proj_source_dict, sel_regions)
-    hist_global_display = _sum_historical(historical_all, sel_regions)
-else:
-    proj_global_display = proj_global
-    hist_global_display = hist_global
-
-# Build comparison projections — each also filtered to sel_regions when active
-# active_key is used for chart labels/colors — always "custom" for custom projections
-active_key = "custom" if custom_projection is not None else sc_id
+# Comparison projections (geography-aware)
 if geo_filtered:
     compare_projs = {
-        cid: _sum_projections(all_projections[cid], sel_regions)
+        cid: sum_projections(all_projections[cid], sel_regions)
         for cid in state.compare_scenarios
         if cid in all_projections
     }
@@ -744,13 +235,16 @@ else:
     }
 compare_projs[active_key] = proj_global_display
 
+
 # ── Sidebar: scenario export button ───────────────────────────────────────
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 💾 Export Scenario")
-_export_filename = f"nuclear_scenario_{active_key}_{pd.Timestamp.today().strftime('%Y-%m-%d')}.xlsx"
+_export_filename = (
+    f"nuclear_scenario_{active_key}_{pd.Timestamp.today().strftime('%Y-%m-%d')}.xlsx"
+)
 st.sidebar.download_button(
     label="⬇ Download Scenario + Settings",
-    data=_build_scenario_export(state, active_key, proj_global_display, proj_by_region),
+    data=build_scenario_export(state, active_key, proj_global_display, proj_by_region),
     file_name=_export_filename,
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     use_container_width=True,
@@ -769,10 +263,7 @@ else:
 st.markdown("## ⚛️ Global Nuclear Capacity Dashboard")
 col_h1, col_h2, col_h3, col_h4 = st.columns(4)
 
-def _gw(df, default=0.0):
-    return float(df["capacity_operating_gw"].iloc[0]) if not df.empty else default
-
-kpi_suffix = " ★" if geo_filtered else ""   # star signals filtered view
+kpi_suffix = " ★" if geo_filtered else ""
 kpi_help   = " (selected regions only)" if geo_filtered else ""
 
 baseline_row = proj_global_display[proj_global_display["year"] == BASELINE_YEAR]
@@ -781,22 +272,22 @@ row_2040     = proj_global_display[proj_global_display["year"] == 2040]
 end_row      = proj_global_display[proj_global_display["year"] == PROJECTION_END_YEAR]
 
 with col_h1:
-    st.metric(f"2024 Baseline{kpi_suffix}", f"{_gw(baseline_row):.0f} GW",
+    st.metric(f"2024 Baseline{kpi_suffix}", f"{gw_from_df(baseline_row):.0f} GW",
               help=f"Current operating capacity (PRIS 2024){kpi_help}")
 with col_h2:
-    val30 = _gw(row_2030)
+    val30 = gw_from_df(row_2030)
     st.metric(f"2030 Projection{kpi_suffix}", f"{val30:.0f} GW",
-              delta=f"{val30-_gw(baseline_row):+.0f} GW vs 2024",
+              delta=f"{val30 - gw_from_df(baseline_row):+.0f} GW vs 2024",
               help=kpi_help.strip() or None)
 with col_h3:
-    val40 = _gw(row_2040)
+    val40 = gw_from_df(row_2040)
     st.metric(f"2040 (Transition){kpi_suffix}", f"{val40:.0f} GW",
-              delta=f"{val40-_gw(baseline_row):+.0f} GW vs 2024",
+              delta=f"{val40 - gw_from_df(baseline_row):+.0f} GW vs 2024",
               help=kpi_help.strip() or None)
 with col_h4:
-    val50 = _gw(end_row)
+    val50 = gw_from_df(end_row)
     st.metric(f"2050 Projection{kpi_suffix}", f"{val50:.0f} GW",
-              delta=f"{val50-_gw(baseline_row):+.0f} GW vs 2024",
+              delta=f"{val50 - gw_from_df(baseline_row):+.0f} GW vs 2024",
               help=kpi_help.strip() or None)
 
 _dl_col1, _dl_col2 = st.columns([6, 1])
@@ -804,7 +295,7 @@ with _dl_col2:
     _reactor_dl_df = load_full_reactor_download()
     st.download_button(
         label="⬇ Full Reactor List",
-        data=_to_excel_bytes(_reactor_dl_df, "All Reactors"),
+        data=to_excel_bytes(_reactor_dl_df, "All Reactors"),
         file_name="nuclear_reactor_list.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         help=f"Download all {len(_reactor_dl_df):,} reactors (operating, pipeline, long-term shutdown)",
@@ -822,8 +313,7 @@ if geo_filtered:
         f"Excluded: {', '.join(excluded)}."
     )
 
-# ── Chart tabs ─────────────────────────────────────────────────────────────
-# ── What-if active banner ──────────────────────────────────────────────────
+# What-if active banner
 if _wi_active:
     _n_overrides = len(st.session_state.get("wi_overrides", []))
     _n_synthetic = len(st.session_state.get("wi_synthetic", []))
@@ -838,6 +328,37 @@ if _wi_active:
         icon=None,
     )
 
+
+# ── Build RenderContext ────────────────────────────────────────────────────
+ctx = RenderContext(
+    # Scenario
+    state=state,
+    sc_id=sc_id,
+    active_key=active_key,
+    custom_projection=custom_projection,
+    session_custom_id=_SESSION_CUSTOM_ID,
+    active_db_id=_active_db_id,
+    # Projections
+    proj_global_display=proj_global_display,
+    proj_by_region=proj_by_region,
+    hist_global_display=hist_global_display,
+    hist_by_region=hist_by_region,
+    compare_projs=compare_projs,
+    proj_source_dict=_proj_source_dict,
+    lab_base_global=_lab_base_global,
+    benchmarks=benchmarks,
+    # Geography
+    sel_regions=sel_regions,
+    geo_filtered=geo_filtered,
+    filtered_reactors=filtered_reactors,
+    # What-if
+    wi_active=_wi_active,
+    wi_ov_json=_wi_ov_json,
+    proj_state=_proj_state,
+)
+
+
+# ── Chart tabs ─────────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4, tab5, tab6, tab_lab = st.tabs([
     "📈 Global Projection",
     "📊 Capacity Breakdown",
@@ -848,595 +369,26 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab_lab = st.tabs([
     "🔬 Scenario Lab",
 ])
 
-
-# ── Tab 1: Global Projection ───────────────────────────────────────────────
 with tab1:
-    # Hide benchmarks when a geography filter is active — global benchmarks
-    # are not comparable to a regional subset of capacity.
-    if geo_filtered:
-        show_benchmarks = {k: False for k in ["IAEA Low", "IAEA High", "IEA STEPS", "IEA APS", "IEA Low Nuclear"]}
-    else:
-        show_benchmarks = {
-            "IAEA Low":        state.show_iaea_low,
-            "IAEA High":       state.show_iaea_high,
-            "IEA STEPS":       state.show_iea_steps,
-            "IEA APS":         state.show_iea_aps,
-            "IEA Low Nuclear": state.show_iea_low_nuclear,
-        }
-    if custom_projection is not None:
-        st.info("Custom lever settings applied. Preset lines available via comparison selector.")
-    if geo_filtered:
-        st.caption(f"📊 Showing sum of {len(sel_regions)} selected regions — benchmark lines hidden (global comparisons not applicable to regional subsets).")
+    render_tab1_global(ctx)
 
-    # When what-if is active, pass the pre-what-if projection as a dotted base line
-    _base_for_diff = None
-    if _wi_active:
-        _base_proj_key = sc_id if custom_projection is None else "custom"
-        _base_for_diff = (
-            _sum_projections(all_projections[sc_id], sel_regions) if geo_filtered
-            else all_projections[sc_id].get("Global", pd.DataFrame())
-        )
-
-    fig1 = chart1_global_projection(
-        projections=compare_projs,
-        historical=hist_global_display if state.show_historical else pd.DataFrame(),
-        benchmarks=benchmarks,
-        active_scenario=active_key,
-        compare_scenarios=state.compare_scenarios,
-        show_historical=state.show_historical,
-        show_benchmarks=show_benchmarks,
-        show_transition_marker=state.show_transition_marker,
-        base_df=_base_for_diff,
-    )
-    _t1c1, _t1c2 = st.columns([8, 1])
-    with _t1c1:
-        st.plotly_chart(fig1, use_container_width=True)
-        st.caption(
-            "**2040 transition:** projections switch from bottom-up (individual reactor data — "
-            "retirements + announced pipeline only) to top-down (global new-build rate lever). "
-            "**Benchmark gap:** IEA/IAEA reference scenarios assume 100–200+ GW of capacity not yet "
-            "announced or under licence — this model includes only reactors with a known construction "
-            "or licence decision. The gap is by design and expected to widen through 2040. "
-            "IEA STEPS/APS 2030 markers (~513/551 GW) serve as near-term cross-checks."
-        )
-        if active_key in ("decline", "custom") and (
-            active_key == "decline"
-            or state.extension_policy_global == "AcceleratedRetirement"
-        ):
-            st.caption(
-                "ℹ️ **No New Extensions policy:** Existing approved licenses are honored in full; "
-                "zero new extension rounds are granted beyond what regulators have already approved. "
-                "US reactors (60-yr licenses) retire through 2029–2045; Japanese reactors follow "
-                "their current approved terms. The gradual capacity decline reflects this staggered "
-                "retirement schedule — not an immediate phase-out."
-            )
-    with _t1c2:
-        _t1_dl = proj_global_display[["year", "capacity_operating_gw",
-                                      "retirements_this_year_gw", "additions_this_year_gw"]].copy()
-        _t1_dl.columns = ["Year", "Capacity (GW)", "Retirements (GW)", "Additions (GW)"]
-        _t1_dl = _t1_dl.round(2)
-        st.download_button("⬇ Data", data=_to_excel_bytes(_t1_dl, "Global Projection"),
-                           file_name="global_projection.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           use_container_width=True)
-
-    with st.expander("Show projection data table"):
-        _tbl_src = proj_global_display if not proj_global_display.empty else proj_global
-        display_df = _tbl_src[["year", "capacity_operating_gw",
-                                "retirements_this_year_gw",
-                                "additions_this_year_gw",
-                                "is_bottom_up"]].copy()
-        display_df.columns = ["Year", "Capacity (GW)", "Retirements (GW)", "Additions (GW)", "Bottom-Up"]
-        display_df["Capacity (GW)"] = display_df["Capacity (GW)"].round(1)
-        display_df["Retirements (GW)"] = display_df["Retirements (GW)"].round(2)
-        display_df["Additions (GW)"] = display_df["Additions (GW)"].round(2)
-        display_df["Bottom-Up"] = display_df["Bottom-Up"].map({1: "Yes", 0: "No"})
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-
-# ── Tab 2: Capacity Breakdown ──────────────────────────────────────────────
 with tab2:
-    breakdown_by = st.radio(
-        "View by",
-        options=["regional", "technology"],
-        format_func=lambda x: "Geography (by region)" if x == "regional" else "Technology (PWR / BWR / PHWR / SMR / Other)",
-        horizontal=True,
-        key="breakdown_split",
-    )
+    render_tab2_breakdown(ctx)
 
-    _t4c1, _t4c2 = st.columns([8, 1])
-
-    if breakdown_by == "regional":
-        fig4 = chart4_regional(
-            projections_by_region=proj_by_region,
-            historical_by_region=hist_by_region,
-            regions=sel_regions,
-            scenario_id=active_key,
-            show_historical=state.show_historical,
-        )
-        with _t4c1:
-            st.plotly_chart(fig4, use_container_width=True)
-            st.caption(
-                "Historical regional totals (shaded area, pre-2025) are derived from 5-year IAEA PRIS "
-                "country snapshots with linear interpolation between survey years. The Global total "
-                "(Tab 1) uses annual IAEA statistics and may differ from the regional sum in years "
-                "affected by sudden capacity changes (e.g., Japan post-Fukushima 2011–2014) or "
-                "countries not reported individually by IAEA (e.g., Taiwan). "
-                "Post-2025 projections are scenario-specific."
-            )
-        with _t4c2:
-            _t4_rows = []
-            for _r in sel_regions:
-                _df_r = _proj_source_dict.get(_r, pd.DataFrame())
-                if _df_r.empty:
-                    continue
-                for _, _row in _df_r.iterrows():
-                    _t4_rows.append({
-                        "Region": _r,
-                        "Year": int(_row["year"]),
-                        "Capacity (GW)": round(float(_row["capacity_operating_gw"]), 2),
-                        "Retirements (GW)": round(float(_row["retirements_this_year_gw"]), 2),
-                        "Additions (GW)": round(float(_row["additions_this_year_gw"]), 2),
-                    })
-            _t4_dl = pd.DataFrame(_t4_rows)
-            st.download_button("⬇ Data", data=_to_excel_bytes(_t4_dl, "Regional Breakdown"),
-                               file_name="regional_breakdown.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                               use_container_width=True)
-
-        with st.expander("Show regional capacity table (2024 / 2030 / 2040 / 2050)"):
-            def _val(df_r, yr):
-                row = df_r[df_r["year"] == yr]
-                return float(row["capacity_operating_gw"].iloc[0]) if not row.empty else 0.0
-
-            rows = []
-            for region in REGIONS:
-                df_r = _proj_source_dict.get(region, pd.DataFrame())
-                if df_r.empty:
-                    continue
-                rows.append({
-                    "Region": region,
-                    "2024 (GW)": round(_val(df_r, 2024), 1),
-                    "2030 (GW)": round(_val(df_r, 2030), 1),
-                    "2040 (GW)": round(_val(df_r, 2040), 1),
-                    "2050 (GW)": round(_val(df_r, 2050), 1),
-                })
-            if rows:
-                tbl = pd.DataFrame(rows)
-                tbl.loc[len(tbl)] = {
-                    "Region": "GLOBAL",
-                    "2024 (GW)": round(_gw(proj_global[proj_global["year"] == 2024]), 1),
-                    "2030 (GW)": round(_gw(proj_global[proj_global["year"] == 2030]), 1),
-                    "2040 (GW)": round(_gw(proj_global[proj_global["year"] == 2040]), 1),
-                    "2050 (GW)": round(_gw(proj_global[proj_global["year"] == 2050]), 1),
-                }
-                st.dataframe(tbl, use_container_width=True, hide_index=True)
-
-    else:
-        # Technology breakdown
-        _regions_key = str(tuple(sorted(sel_regions))) if geo_filtered else "all"
-        with st.spinner("Computing technology breakdown…"):
-            tech_df = load_tech_projection(
-                scenario_id=_active_db_id,
-                regions_key=_regions_key,
-                smr_post2040_share=state.smr_post2040_share,
-                smr_accel_start_year=state.smr_accel_start_year if state.smr_accel_gw_per_year > 0 else 0,
-                smr_accel_gw_per_year=state.smr_accel_gw_per_year,
-                what_if_overrides_json=_wi_ov_json_global if _wi_active else "",
-            )
-        st.caption(
-            "Post-2040 technology split is estimated: SMR share from the lever; "
-            "PWR/BWR/PHWR/Other proportions extrapolated from the 2040 fleet composition."
-        )
-        fig4t = chart4_technology(
-            tech_df=tech_df,
-            historical=hist_global_display if state.show_historical else pd.DataFrame(),
-            scenario_id=active_key,
-            show_historical=state.show_historical,
-        )
-        with _t4c1:
-            st.plotly_chart(fig4t, use_container_width=True)
-        with _t4c2:
-            _t4t_dl = tech_df.pivot_table(
-                index="year", columns="tech_group", values="capacity_gw"
-            ).reset_index()
-            _t4t_dl.columns.name = None
-            _t4t_dl = _t4t_dl.round(2)
-            st.download_button("⬇ Data",
-                               data=_to_excel_bytes(_t4t_dl, "Technology Breakdown"),
-                               file_name="technology_breakdown.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                               use_container_width=True)
-
-        with st.expander("Show technology capacity table (2024 / 2030 / 2040 / 2050)"):
-            _tech_pivot = tech_df[tech_df["year"].isin([2024, 2030, 2040, 2050])].pivot_table(
-                index="tech_group", columns="year", values="capacity_gw"
-            ).reset_index()
-            _tech_pivot.columns = ["Technology"] + [str(c) + " (GW)" for c in _tech_pivot.columns[1:]]
-            _tech_pivot = _tech_pivot.round(1)
-            st.dataframe(_tech_pivot, use_container_width=True, hide_index=True)
-
-
-# ── Tab 3: Retirements ─────────────────────────────────────────────────────
 with tab3:
-    st.caption(
-        "Annual retirements shown as negative values. Stacked by region — "
-        "areas reflect gross capacity removed each year."
-    )
-    fig5 = chart5_retirements(
-        projections_by_region=proj_by_region,
-        regions=sel_regions,
-        scenario_id=active_key,
-    )
-    _t5c1, _t5c2 = st.columns([8, 1])
-    with _t5c1:
-        st.plotly_chart(fig5, use_container_width=True)
-    with _t5c2:
-        _t5_rows = []
-        for _r in sel_regions:
-            _df_r = _proj_source_dict.get(_r, pd.DataFrame())
-            if _df_r.empty:
-                continue
-            for _, _row in _df_r.iterrows():
-                if _row["year"] <= 2024:
-                    continue
-                _t5_rows.append({
-                    "Region": _r,
-                    "Year": int(_row["year"]),
-                    "Retirements (GW)": round(float(_row["retirements_this_year_gw"]), 3),
-                })
-        _t5_dl = pd.DataFrame(_t5_rows)
-        st.download_button("⬇ Data", data=_to_excel_bytes(_t5_dl, "Retirements"),
-                           file_name="retirements_by_region.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           use_container_width=True)
+    render_tab3_retirements(ctx)
 
-
-# ── Tab 4: New Additions ───────────────────────────────────────────────────
 with tab4:
-    split_by = st.radio(
-        "View by",
-        options=["geography", "technology"],
-        format_func=lambda x: "Geography (by region)" if x == "geography" else "Technology (SMR vs Large)",
-        horizontal=True,
-        key="additions_split",
-    )
-    # For technology split: compute tech_df so SMR fraction uses scenario-adjusted
-    # pipeline (delay adder + realization rates) rather than raw reactor data.
-    _tech_df_for_chart6: pd.DataFrame | None = None
-    if split_by == "technology":
-        _regions_key_t3 = str(tuple(sorted(sel_regions))) if geo_filtered else "all"
-        with st.spinner("Computing technology breakdown…"):
-            _tech_df_for_chart6 = load_tech_projection(
-                scenario_id=_active_db_id,
-                regions_key=_regions_key_t3,
-                smr_post2040_share=state.smr_post2040_share,
-                smr_accel_start_year=state.smr_accel_start_year if state.smr_accel_gw_per_year > 0 else 0,
-                smr_accel_gw_per_year=state.smr_accel_gw_per_year,
-                what_if_overrides_json=_wi_ov_json_global if _wi_active else "",
-            )
-    # Warning: planned reactors with no announced construction date are excluded
-    _no_date = reactors[
-        (reactors["status"] == "Planned") & (reactors["expected_online_year"].isna())
-    ]
-    _nd_info_text = None
-    if not _no_date.empty:
-        _nd_gw = _no_date["net_capacity_mw"].sum() / 1000
-        _nd_countries = _no_date["country"].value_counts().head(4)
-        _nd_summary = ", ".join(f"{c} ({n})" for c, n in _nd_countries.items())
-        _nd_info_text = (
-            f"ℹ️ **{len(_no_date)} Planned reactors ({_nd_gw:.1f} GW) have no announced "
-            f"construction-start date and are excluded from all projections.** "
-            f"Largest groups: {_nd_summary}. "
-            f"These units will appear in projections once an expected online year is confirmed."
-        )
-    fig6 = chart6_additions(
-        projections_by_region=proj_by_region,
-        reactors=reactors,
-        regions=sel_regions,
-        scenario_id=active_key,
-        split_by=split_by,
-        smr_post2040_share=state.smr_post2040_share,
-        tech_df=_tech_df_for_chart6,
-    )
-    _t6c1, _t6c2 = st.columns([8, 1])
-    with _t6c1:
-        st.plotly_chart(fig6, use_container_width=True)
-        st.caption(
-            "Annual new capacity additions. Post-2040 SMR share set by the SMR lever. "
-            "Pre-2040 SMR share derived from the scenario-adjusted pipeline "
-            "(technology split) or summed by region (geography split)."
-        )
-        if _nd_info_text:
-            st.info(_nd_info_text)
-    with _t6c2:
-        _t6_rows = []
-        for _r in sel_regions:
-            _df_r = _proj_source_dict.get(_r, pd.DataFrame())
-            if _df_r.empty:
-                continue
-            for _, _row in _df_r.iterrows():
-                if _row["year"] <= 2024:
-                    continue
-                _t6_rows.append({
-                    "Region": _r,
-                    "Year": int(_row["year"]),
-                    "Additions (GW)": round(float(_row["additions_this_year_gw"]), 3),
-                })
-        _t6_dl = pd.DataFrame(_t6_rows)
-        st.download_button("⬇ Additions", data=_to_excel_bytes(_t6_dl, "New Additions"),
-                           file_name="new_additions_by_region.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           use_container_width=True)
-        # Pipeline reactor list download
-        _pipe_dl = filtered_reactors[filtered_reactors["status"].isin(
-            ["UnderConstruction", "Planned", "Proposed"])].copy()
-        _pipe_cols = ["name", "country", "region", "status", "net_capacity_mw",
-                      "expected_online_year", "reactor_type", "is_smr"]
-        _pipe_cols = [c for c in _pipe_cols if c in _pipe_dl.columns]
-        _pipe_dl = _pipe_dl[_pipe_cols].sort_values(["status", "expected_online_year", "country"])
-        _pipe_dl.columns = ["Name", "Country", "Region", "Status", "Capacity (MW)",
-                            "Expected Online Year", "Reactor Type", "SMR"]
-        st.download_button("⬇ Pipeline", data=_to_excel_bytes(_pipe_dl, "Pipeline Reactors"),
-                           file_name="pipeline_reactors.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           use_container_width=True)
+    render_tab4_additions(ctx)
 
-
-# ── Tab 5: Country Snapshot ────────────────────────────────────────────────
 with tab5:
-    col71, col72 = st.columns([1, 3])
-    with col71:
-        snapshot_year = st.select_slider(
-            "Snapshot year",
-            options=list(range(2005, 2051)),
-            value=2026,
-            key="country_snapshot_year",
-        )
-    with col72:
-        st.caption(
-            f"Country-level nuclear capacity for **{snapshot_year}** under the "
-            f"**{active_key.title()}** scenario. Operating fleet + pipeline additions "
-            f"expected online by that year (weighted by realization rates)."
-        )
+    render_tab5_country(ctx)
 
-    with st.spinner("Loading country data…"):
-        if _wi_active:
-            country_df = get_what_if_country_capacity(
-                year=snapshot_year, scenario_id=_active_db_id,
-                state=_proj_state)
-        else:
-            country_df = load_country_capacity(year=snapshot_year, scenario_id=_active_db_id)
-
-    # Normalise country names to title case (DB stores them in ALL CAPS)
-    if "country" in country_df.columns:
-        country_df = country_df.copy()
-        country_df["country"] = country_df["country"].str.title()
-
-    fig7 = chart7_country_bar(
-        country_df=country_df,
-        year=snapshot_year,
-        scenario_id=active_key,
-        regions=sel_regions,
-    )
-    _t7c1, _t7c2 = st.columns([8, 1])
-    with _t7c1:
-        st.plotly_chart(fig7, use_container_width=True)
-    with _t7c2:
-        _t7_dl = country_df.copy()
-        if sel_regions:
-            _t7_dl = _t7_dl[_t7_dl["region"].isin(sel_regions)]
-        _t7_dl = _t7_dl[_t7_dl["total_gw"] > 0].sort_values("total_gw", ascending=False)
-        _t7_dl.columns = [c.replace("_", " ").title() for c in _t7_dl.columns]
-        st.download_button("⬇ Data", data=_to_excel_bytes(_t7_dl, f"Country Snapshot {snapshot_year}"),
-                           file_name=f"country_snapshot_{snapshot_year}.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           use_container_width=True)
-
-    with st.expander("Show country data table"):
-        tbl7 = country_df.copy()
-        if sel_regions:
-            tbl7 = tbl7[tbl7["region"].isin(sel_regions)]
-        tbl7 = tbl7[tbl7["total_gw"] > 0].sort_values("total_gw", ascending=False)
-        tbl7.columns = [c.replace("_", " ").title() for c in tbl7.columns]
-        st.dataframe(tbl7, use_container_width=True, hide_index=True)
-
-
-# ── Tab 6: World Map ──────────────────────────────────────────────────────
 with tab6:
-    _mc1, _mc2, _mc3 = st.columns([2, 2, 5])
-    with _mc1:
-        map_year = st.select_slider(
-            "Year",
-            options=list(range(2005, 2051)),
-            value=2026,
-            key="map_year",
-        )
-    with _mc2:
-        map_metric = st.radio(
-            "Show",
-            options=["total_gw", "operating_gw", "pipeline_gw"],
-            format_func=lambda x: {
-                "total_gw": "Total (operating + pipeline)",
-                "operating_gw": "Operating only",
-                "pipeline_gw": "Pipeline only",
-            }[x],
-            key="map_metric",
-        )
-    with _mc3:
-        if map_year < 2024:
-            st.caption(
-                f"Historical view ({map_year}): showing reactors operating based on "
-                "actual commissioning/retirement dates. Retired reactors not in the "
-                "current database are excluded."
-            )
-        else:
-            st.caption(
-                f"Projection view ({map_year}): operating fleet accounting for "
-                "retirements + pipeline additions weighted by realization rates "
-                f"under the **{active_key.title()}** scenario."
-            )
+    render_tab6_map(ctx)
 
-    with st.spinner("Loading map data…"):
-        if _wi_active:
-            map_country_df = get_what_if_country_capacity(
-                year=map_year, scenario_id=_active_db_id,
-                state=_proj_state)
-        else:
-            map_country_df = load_country_capacity(year=map_year, scenario_id=_active_db_id)
-
-    if geo_filtered:
-        map_country_df = map_country_df[map_country_df["region"].isin(sel_regions)]
-
-    fig_map = chart_map(
-        country_df=map_country_df,
-        year=map_year,
-        metric=map_metric,
-        scenario_id=active_key,
-    )
-    _tm1, _tm2 = st.columns([8, 1])
-    with _tm1:
-        st.plotly_chart(fig_map, use_container_width=True)
-    with _tm2:
-        _map_dl = map_country_df[map_country_df[map_metric] > 0].copy()
-        _map_dl = _map_dl.sort_values(map_metric, ascending=False)
-        _map_dl.columns = [c.replace("_", " ").title() for c in _map_dl.columns]
-        st.download_button(
-            "⬇ Data",
-            data=_to_excel_bytes(_map_dl, f"Map {map_year}"),
-            file_name=f"world_map_{map_year}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-
-
-# ── Tab 7: Scenario Lab ────────────────────────────────────────────────────
 with tab_lab:
-    st.subheader("🔬 Scenario Lab")
-
-    # Build defaults from current preset for the lab form
-    _lab_preset = st.session_state.get("preset_selector", "base")
-    _lab_sc_id  = _lab_preset if _lab_preset != "custom" else "base"
-    _lab_defaults = PRESET_DEFAULTS.get(_lab_sc_id if _lab_sc_id != "custom" else "base",
-                                        PRESET_DEFAULTS["base"])
-
-    lab_submitted = render_lab_panel(_lab_sc_id, _lab_defaults)
-
-    if lab_submitted:
-        # Step 1: recompute macro levers if they differ from preset
-        if not _levers_match_preset(state, sc_id):
-            with st.spinner("Computing custom projection…"):
-                custom_projection = write_and_run_custom_scenario(
-                    extension_policy=state.extension_policy_global,
-                    pipeline_uc_rate=state.pipeline_uc_rate,
-                    pipeline_planned_rate=state.pipeline_planned_rate,
-                    pipeline_proposed_rate=state.pipeline_proposed_rate,
-                    construction_delay_adder=state.construction_delay_adder,
-                    post2040_global_gw=state.post2040_global_growth_gw,
-                    smr_uc_rate=state.smr_uc_rate,
-                    smr_planned_rate=state.smr_planned_rate,
-                    smr_proposed_rate=state.smr_proposed_rate,
-                    china_post2040_gw=state.china_post2040_gw,
-                    smr_accel_start_year=state.smr_accel_start_year,
-                    smr_accel_gw_per_year=state.smr_accel_gw_per_year,
-                    scenario_id=_SESSION_CUSTOM_ID,
-                )
-            st.session_state["_custom_projection"] = custom_projection
-            st.session_state["_custom_for_scenario"] = sc_id
-            active_scenario_id = _SESSION_CUSTOM_ID
-        else:
-            # Levers match preset — clear any custom, use precomputed
-            st.session_state.pop("_custom_projection", None)
-            custom_projection = None
-            active_scenario_id = sc_id
-
-        # Step 2: run what-if overrides on top
-        wi_dict = _build_wi_overrides_dict()
-        if wi_dict:
-            with st.spinner("Running what-if projection across all regions…"):
-                try:
-                    wi_all = run_what_if_all_regions(
-                        scenario_id=active_scenario_id,
-                        what_if_overrides=wi_dict,
-                    )
-                    st.session_state["wi_proj_all"] = wi_all
-                    st.session_state["wi_result"]   = wi_all.get("Global")
-                except Exception as e:
-                    st.error(f"Projection failed: {e}")
-        else:
-            st.session_state["wi_proj_all"] = None
-            st.session_state["wi_result"]   = None
-
-        st.rerun()
-
-    # ── Diff chart + bullet summary ───────────────────────────────────────
-    # Show whenever there are any active customisations (levers, overrides,
-    # synthetic builds) — not only when wi_result exists.
-    _has_wi_result     = st.session_state.get("wi_result") is not None
-    _has_customisation = (
-        _has_wi_result
-        or bool(st.session_state.get("wi_overrides"))
-        or bool(st.session_state.get("wi_synthetic"))
-        or not _levers_match_preset(state, active_key)
-    )
-
-    if _has_customisation and not _lab_base_global.empty:
-        # Use the what-if projection if available, otherwise the current
-        # (lever-adjusted) display projection as the "what-if" side.
-        if _has_wi_result:
-            wi_proj_for_chart = st.session_state["wi_result"]
-        else:
-            wi_proj_for_chart = proj_global_display
-
-        _base_cols = ["year", "capacity_operating_gw",
-                      "retirements_this_year_gw", "additions_this_year_gw",
-                      "is_bottom_up"]
-        base_proj = _lab_base_global[
-            [c for c in _base_cols if c in _lab_base_global.columns]
-        ].copy()
-
-        fig_wi = chart_what_if_diff(
-            base_df=base_proj,
-            whatif_df=wi_proj_for_chart,
-            base_label=f"{sc_id.title()} (starting point)",
-            whatif_label="Custom scenario",
-        )
-
-        _col_chart, _col_bullets = st.columns([3, 2], gap="large")
-        with _col_chart:
-            st.plotly_chart(fig_wi, use_container_width=True)
-
-            # Compact delta table beneath the chart
-            delta_rows = []
-            for yr in [2030, 2035, 2040, 2050]:
-                b = base_proj.loc[base_proj["year"] == yr, "capacity_operating_gw"]
-                w = wi_proj_for_chart.loc[
-                    wi_proj_for_chart["year"] == yr, "capacity_operating_gw"
-                ]
-                if not b.empty and not w.empty:
-                    delta = round(w.values[0] - b.values[0], 1)
-                    delta_rows.append({
-                        "Year": yr,
-                        f"{active_key.title()} base (GW)": round(b.values[0], 1),
-                        "Custom (GW)":   round(w.values[0], 1),
-                        "Delta (GW)":    f"{'+' if delta >= 0 else ''}{delta}",
-                    })
-            if delta_rows:
-                st.dataframe(delta_rows, hide_index=True, use_container_width=True)
-
-        with _col_bullets:
-            st.markdown("**What's been customised**")
-            _bullets = _build_scenario_bullets(
-                state,
-                active_key,
-                wi_overrides=st.session_state.get("wi_overrides", []),
-                wi_synthetic=st.session_state.get("wi_synthetic", []),
-            )
-            if _bullets:
-                for _b in _bullets:
-                    st.markdown(f"- {_b}")
-            else:
-                st.caption("No changes from the base preset yet.")
+    render_tab7_lab(ctx)
 
 
 # ── Footer & Disclaimer ────────────────────────────────────────────────────
@@ -1446,49 +398,115 @@ with st.expander("ℹ️ About this dashboard & methodology", expanded=False):
     st.markdown("""
 **What this is**
 
-An interactive scenario modelling tool for global nuclear power capacity from 2024 to 2050.
-It is intended for research and educational purposes. Charts and projections are
-**scenario outputs, not predictions** — they reflect the assumptions you set via the levers,
-not a forecast of what will happen.
+An interactive scenario modelling tool for global nuclear power capacity from 2024 to 2050,
+built on unit-level reactor data from IAEA PRIS. Charts and projections are
+**scenario outputs, not predictions** — they reflect the assumptions you set via the levers.
+For research and educational use only. A full methodology document is available separately.
+
+---
 
 **Model structure**
 
 The model operates in two phases:
-- **2024–2040 (bottom-up):** Unit-level simulation. Each reactor is tracked individually —
-  retirement dates are computed from country-specific licensing rules and the chosen extension
-  policy; pipeline reactors are included weighted by their realization probability and any
-  construction delay you apply.
-- **2040–2050 (top-down):** A growth-rate bridge. Unit-level retirements continue, but new
-  additions are driven by the global GW/yr rate you set, distributed across regions using
-  calibrated weights.
+- **2024–2040 (bottom-up):** Every reactor is tracked individually. Retirement dates are derived
+  from country-specific licensing rules (Tier 2) or declared dates (Tier 1). Pipeline reactors
+  enter service at their expected online year, subject to the realization rate and any
+  construction delay adder you apply.
+- **2040–2050 (top-down):** Unit-level retirements continue, but new additions are driven by the
+  global GW/yr rate calibrated to the selected benchmark, distributed across regions using
+  IAEA/IEA regional proportions. **2024 baseline:** last full IAEA PRIS vintage; historical data
+  from 2005 gives two decades of context.
 
-**Key assumptions & limitations**
+---
 
-- Reactor retirement dates are derived from country licensing rules (Tier 2) or declared
-  shutdown dates (Tier 1). Where neither is available, a 60-year default life is assumed.
-- Pipeline realization rates are deterministic probability weights, not stochastic simulations.
-- Post-2040 new build is a smooth top-down rate and does not model project-level uncertainty.
-- Historical data (2005–2023) is sourced from IAEA RDS-2; it reflects observed capacity,
-  not model outputs.
-- Reactors decommissioned before 2024 are not in the database; historical country-level
-  figures for earlier years may be understated as a result.
+**Scenario assumptions — what each scenario actually does**
 
-**Data sources & attribution**
+| | 🔴 Decline | 🟠 Conservative | 🔵 Base | 🟢 Optimistic |
+|---|---|---|---|---|
+| **Life extension** | None (AcceleratedRetirement) | ~50% eligible units (CurrentPolicy) | ~50% eligible units (CurrentPolicy) | 100% to max life (ExtendedOperations) |
+| **US exception** | Same — no extra extensions | ExtendedOperations¹ | ExtendedOperations¹ | ExtendedOperations |
+| **Pipeline: UC** | 100% | 100% | 100% | 100% |
+| **Pipeline: Planned** | 0% | 100% | 100% | 100% |
+| **Pipeline: Proposed** | 0% | 0% | 0% | 100% |
+| **Construction delay** | +3 years | +2 years | 0 years | 0 years |
+| **Post-2040 new build** | ~10 GW/yr | ~35 GW/yr | ~30 GW/yr | ~57 GW/yr |
+| **2050 capacity** | ~250 GW | ~561 GW | ~647 GW | ~992 GW |
+| **Calibration benchmark** | IEA Low Nuclear | IAEA Low (RDS-1) | IEA STEPS (WEO 2024) | IAEA High (RDS-1) |
 
-| Source | Coverage | Terms |
-|--------|----------|-------|
-| [IAEA PRIS](https://pris.iaea.org/) | Operating & pipeline reactors, commissioning/retirement dates | © IAEA — data used with attribution; not for commercial redistribution |
-| [IAEA RDS-1 2025](https://www.iaea.org/publications/15510/nuclear-power-reactors-in-the-world) | Benchmark scenarios (Low / High) | © IAEA |
-| [IAEA RDS-2](https://www.iaea.org/publications/15510/nuclear-power-reactors-in-the-world) | Historical capacity 2005–2023 | © IAEA |
-| [IEA World Energy Outlook 2024](https://www.iea.org/reports/world-energy-outlook-2024) | Benchmark scenarios (STEPS / APS / Low Nuclear) | © IEA — used for reference |
-| [WNA Reactor Database](https://www.world-nuclear.org/) | Pipeline supplemental data | © WNA |
+¹ *All US plants treated as ExtendedOperations in Base/Conservative: NRC licence renewal data shows
+virtually all operational US plants already hold 60-year licences, with subsequent licence renewal
+(SLR) applications in progress for 80-year operation. Applying a 50% CurrentPolicy haircut would
+understate approvals already granted.*
 
-**Disclaimer**
+---
 
-This tool is provided for informational and research purposes only. The authors make no
-representations as to the accuracy, completeness, or suitability of the projections for
-any particular purpose. Scenario outputs should not be used as the basis for investment,
-policy, or engineering decisions without independent verification.
+**Pipeline realization — what "High / Medium / Low" means**
+
+- **High** (Optimistic): Under Construction 100% + Planned 100% + Proposed 100%
+- **Medium** (Base, Conservative): Under Construction 100% + Planned 100% + Proposed 0%
+- **Low** (Decline): Under Construction 100% only; Planned and Proposed excluded
+
+Pipeline realization is **binary per reactor** (fully in or fully out) in preset scenarios,
+not a fractional probability. Custom scenarios in the Scenario Lab can use intermediate values.
+
+---
+
+**Country-level retirement rules (selected)**
+
+| Country | Baseline licence | Max life (current law) | Key driver |
+|---------|-----------------|----------------------|------------|
+| United States | 40 yr | 80 yr (NRC renewals in 2×20yr steps) | NRC licence renewal; nearly all plants at 60yr |
+| France | 40 yr | ~60 yr (ASN 10-yr reviews) | Periodic safety reviews; 60yr policy under development |
+| China | 40 yr | ~50 yr (extensions not yet routine) | Young fleet; extensions not standardised |
+| Russia | 30 yr | 60 yr (15yr extension increments) | Rosatom standard; 60yr operating target |
+| Japan | 40 yr | 80 yr (2023 law) | NRA post-Fukushima rules; 2023 law allows beyond 60yr |
+| South Korea | 40 yr | 60 yr | NSSC case-by-case |
+| United Kingdom | ~35 yr | ~55 yr | ONR lifecycle licence; no fixed maximum |
+| Germany | — | Phase-out complete Apr 2023 | No modelled extensions |
+| Taiwan | 40 yr | 40 yr (no extensions) | Government phase-out policy |
+
+---
+
+**Benchmark alignment**
+
+| Benchmark | 2030 | 2040 | 2050 | Matched scenario |
+|-----------|------|------|------|-----------------|
+| IEA Low Nuclear Case | — | — | ~250 GW | Decline |
+| IAEA Low Case (RDS-1 2025) | 425 GW | 519 GW | ~561 GW | Conservative |
+| IEA STEPS (WEO 2024) | 513 GW | 586 GW | ~647 GW | Base |
+| IEA APS (WEO 2024) | 551 GW | 748 GW | ~874 GW | (reference only) |
+| IAEA High Case (RDS-1 2025) | 445 GW | 710 GW | ~992 GW | Optimistic |
+
+Only the **2050 terminal value** is explicitly calibrated per scenario. Intermediate years
+(2030, 2040) are determined by the bottom-up fleet simulation and may differ from the
+benchmark's own intermediate milestones.
+
+---
+
+**Key limitations**
+
+- Retirement dates are rule-based, not market-driven — economic early retirements (e.g. German
+  Energiewende) may not be captured for future scenarios unless added as what-if overrides.
+- Post-2040 projections are top-down and directional only; treat with appropriate uncertainty.
+- Pipeline data reflects IAEA PRIS/WNA/WNN as of end-2024; 2025+ announcements not automatically included.
+- SMRs are included where in PRIS/WNA pipeline; future commercial SMR scale-up is folded into
+  the post-2040 growth rate, not modelled at the unit level.
+
+---
+
+**Data sources**
+
+| Source | Coverage |
+|--------|----------|
+| [IAEA PRIS](https://pris.iaea.org/) | Operating & pipeline reactors worldwide; commissioning/retirement dates |
+| [IAEA RDS-1 2025](https://www.iaea.org/publications/15510/nuclear-power-reactors-in-the-world) | Benchmark scenarios Low/High at 2030/2040/2050 |
+| [IEA World Energy Outlook 2024](https://www.iea.org/reports/world-energy-outlook-2024) | STEPS/APS/Low Nuclear benchmarks |
+| [WNA Reactor Database](https://www.world-nuclear.org/) | Pipeline supplemental data |
+| National regulators (NRC, ASN, ONR, etc.) | Country-specific extension rules |
+
+**Disclaimer:** This tool is for informational and research purposes only. Scenario outputs
+should not be used as the basis for investment, policy, or engineering decisions without
+independent verification.
     """)
 
 st.caption(

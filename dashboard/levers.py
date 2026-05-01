@@ -452,7 +452,7 @@ def render_sidebar_panel() -> tuple:
     # ── Scenario Comparison ────────────────────────────────────────────────
     st.sidebar.markdown("---")
     all_scenarios = ["decline", "conservative", "base", "optimistic"]
-    compare_opts = [s for s in all_scenarios if s != scenario_id]
+    compare_opts = all_scenarios
     compare_labels = {
         "decline": "Decline", "conservative": "Conservative",
         "base": "Base", "optimistic": "Optimistic",

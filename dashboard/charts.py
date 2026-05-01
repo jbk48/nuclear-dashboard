@@ -508,10 +508,7 @@ def chart4_regional(
                 stackgroup="regions",
                 legendgroup=region,
                 showlegend=False,
-                hovertemplate=(
-                    f"<b>{region}</b><br>%{{x}}: %{{y:.1f}} GW"
-                    "<br><i>Top-down estimate</i><extra></extra>"
-                ),
+                hoverinfo="skip",
             ))
 
     fig.add_vline(
@@ -628,10 +625,7 @@ def chart4_technology(
                 stackgroup="tech",
                 legendgroup=group,
                 showlegend=False,
-                hovertemplate=(
-                    f"<b>{label}</b><br>%{{x}}: %{{y:.1f}} GW"
-                    "<br><i>Top-down estimate</i><extra></extra>"
-                ),
+                hoverinfo="skip",
             ))
 
     fig.add_vline(

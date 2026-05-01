@@ -133,3 +133,20 @@ def db():
     conn = _make_db()
     yield conn
     conn.close()
+
+
+@pytest.fixture
+def db_path(tmp_path):
+    """Write the in-memory test DB to a temp file.
+
+    Used by tests that call build_projection_state(), which opens the DB
+    by path internally and cannot accept an existing connection.
+    The temp file is automatically removed by pytest after each test.
+    """
+    mem_conn  = _make_db()
+    file_path = tmp_path / "test_nuclear.db"
+    file_conn = sqlite3.connect(str(file_path))
+    mem_conn.backup(file_conn)
+    file_conn.close()
+    mem_conn.close()
+    yield file_path
