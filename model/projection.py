@@ -258,6 +258,10 @@ def run_projection(
                 result = v   # running total — take the latest (largest key ≤ year)
         return result
 
+    # LTS restarts are honoured only in scenarios where lts_restarts_enabled=1
+    # (base, optimistic). Conservative and decline keep LTS reactors dark.
+    lts_restarts_enabled = bool(params.get("lts_restarts_enabled", 1))
+
     # ── Projection loop ───────────────────────────────────────────────────
     results: list[dict] = []
 
@@ -307,9 +311,10 @@ def run_projection(
                 for (rid, reg, status, cap_mw, restart_date) in operating_fleet:
                     if reg != region:
                         continue
-                    # LTS reactors are dark unless they have a restart_date ≤ current year
+                    # LTS reactors are dark unless restarts are enabled for this
+                    # scenario AND the reactor has a restart_date ≤ current year
                     if status == "LongTermShutdown":
-                        if not restart_date:
+                        if not lts_restarts_enabled or not restart_date:
                             continue
                         if int(restart_date[:4]) > year:
                             continue
