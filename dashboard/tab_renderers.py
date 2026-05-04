@@ -137,7 +137,12 @@ def render_tab1_global(ctx: RenderContext) -> None:
             "**Benchmark gap:** IEA/IAEA reference scenarios assume 100–200+ GW of capacity not yet "
             "announced or under licence — this model includes only reactors with a known construction "
             "or licence decision. The gap is by design and expected to widen through 2040. "
-            "IEA STEPS/APS 2030 markers (~513/551 GW) serve as near-term cross-checks."
+            "IEA STEPS/APS 2030 markers (~513/551 GW) serve as near-term cross-checks. "
+            "**2024 starting point:** IEA/IAEA benchmark lines begin at ~377 GW vs this model's "
+            "373 GW. The ~4 GW difference is because IEA/IAEA report total *installed* capacity, "
+            "counting long-term shutdown (LTS) reactors — primarily Japan's idled fleet — as "
+            "installed regardless of whether they are generating power. This model tracks *operating* "
+            "capacity only."
         )
         if ctx.active_key in ("decline", "custom") and (
             ctx.active_key == "decline"
