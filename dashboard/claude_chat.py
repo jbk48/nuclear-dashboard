@@ -1452,6 +1452,19 @@ def _is_analytical_question(msg: str) -> bool:
     """Return True if the message looks like a data/analysis query rather than a model action."""
     m = msg.lower().strip()
 
+    # "What if / what happens if / what would happen if" → scenario change requests.
+    # These belong to the action agent even though they start with "what".
+    _scenario_prefixes = (
+        "what if ",
+        "what happens if",
+        "what would happen if",
+        "what would it look like if",
+        "what would change if",
+    )
+    for phrase in _scenario_prefixes:
+        if m.startswith(phrase):
+            return False
+
     # Strong imperative action verbs at the start → action agent
     _action_prefixes = (
         "set ", "apply ", "retire ", "extend the life", "make ",
@@ -1463,9 +1476,13 @@ def _is_analytical_question(msg: str) -> bool:
         if m.startswith(prefix):
             return False
 
-    # Analytical question patterns
+    # Pure data / analytical question starters
     _analytical_starts = (
-        "what", "how", "when", "which", "where", "why", "who",
+        "what is", "what are", "what was", "what were", "what does",
+        "what's", "what ",   # catch-all "what" only after filtering "what if" above
+        "how much", "how many", "how does", "how do", "how has", "how far",
+        "when does", "when did", "when will", "when is",
+        "which", "where", "why", "who",
         "is ", "are ", "does ", "can ", "could ", "would ", "will ",
         "compare", "show me", "tell me", "explain", "describe",
         "give me", "list ", "find ",

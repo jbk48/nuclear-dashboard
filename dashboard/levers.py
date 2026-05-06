@@ -590,16 +590,18 @@ def render_lab_panel(scenario_id: str, defaults: dict) -> bool:
 - *"What's the retirement schedule for the US between 2025 and 2035?"*
 - *"Which region contributes most to global growth under the optimistic scenario?"*
 - *"Tell me about Hinkley Point C"*
-- *"What happens if East Asia delivers its full proposed pipeline?"*
+- *"How much capacity does China add between 2025 and 2035 under optimistic?"*
 
 **Scenario changes** (Claude proposes lever changes — click Apply to update charts):
+- *"What if there's a major nuclear accident in 2028?"*
+- *"What if SMR overnight costs drop sharply by 2032?"*
+- *"What if the West stops building new reactors after 2030?"*
 - *"Switch to extended operations policy — maximum licence life for all reactors"*
 - *"Set pipeline realization to high — include all proposed reactors"*
 - *"Add a 3-year construction delay to all pipeline projects"*
 - *"Retire all French reactors by 2035"*
 - *"Extend the operating life of all US reactors to 2060"*
 - *"Add 5 GW/yr of SMRs in North America starting 2030 for 10 years"*
-- *"What if there's a major nuclear accident in 2028?"*
 """)
 
     # Init chat state
