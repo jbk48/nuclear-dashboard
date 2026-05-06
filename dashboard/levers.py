@@ -578,32 +578,28 @@ def render_lab_panel(scenario_id: str, defaults: dict) -> bool:
     # ── Claude chat section (top of Lab — primary interaction point) ───────
     st.markdown("### 💬 Ask Claude")
     st.caption(
-        "Describe a scenario in plain English and Claude will translate it into model changes. "
-        "You can then fine-tune further using the manual controls below."
+        "Ask analytical questions about the data, or describe a scenario change in plain English. "
+        "Claude will answer from the live database or propose model changes — depending on what you ask."
     )
     with st.expander("💡 What can I ask?", expanded=False):
         st.markdown("""
-**Macro levers** (affect all reactors globally):
+**Analytical questions** (answered directly from the data — no Apply needed):
+- *"How far is the base scenario from the IEA APS target in 2040?"*
+- *"Compare all four scenarios for Global capacity in 2035"*
+- *"When does China's capacity exceed the US?"*
+- *"What's the retirement schedule for the US between 2025 and 2035?"*
+- *"Which region contributes most to global growth under the optimistic scenario?"*
+- *"Tell me about Hinkley Point C"*
+- *"What happens if East Asia delivers its full proposed pipeline?"*
+
+**Scenario changes** (Claude proposes lever changes — click Apply to update charts):
 - *"Switch to extended operations policy — maximum licence life for all reactors"*
 - *"Set pipeline realization to high — include all proposed reactors"*
 - *"Add a 3-year construction delay to all pipeline projects"*
-- *"Increase post-2040 global new build to 50 GW/yr"*
-
-**Synthetic new builds** (hypothetical capacity not in the database):
-- *"Add 5 GW/yr of SMRs in North America starting 2030 for 10 years"*
-- *"Model 3 × 1 GW large reactors per year in Southeast Asia from 2035"*
-
-**Reactor-level overrides** (specific units — search by country or name):
 - *"Retire all French reactors by 2035"*
 - *"Extend the operating life of all US reactors to 2060"*
-- *"Restart the Japanese long-term shutdown reactors in 2027"*
-
-**Economic / indirect scenarios** (Claude will interpret and propose adjustments):
-- *"What if SMR overnight costs drop to $5,000/kW by 2032?"*
+- *"Add 5 GW/yr of SMRs in North America starting 2030 for 10 years"*
 - *"What if there's a major nuclear accident in 2028?"*
-- *"What if carbon prices reach $200/tonne by 2035?"*
-
-After Claude proposes changes, click **✅ Apply changes** — all 6 chart tabs will update. You can then make further manual adjustments below.
 """)
 
     # Init chat state
@@ -710,7 +706,7 @@ After Claude proposes changes, click **✅ Apply changes** — all 6 chart tabs 
 
     # Chat input box
     _chat_input = st.chat_input(
-        "e.g. 'Retire all US reactors by 2035' or 'Add 5 GW/yr SMRs in Asia from 2030'"
+        "Ask a question or describe a scenario change…"
     )
     if _chat_input:
         _api_key = ""
@@ -727,9 +723,9 @@ After Claude proposes changes, click **✅ Apply changes** — all 6 chart tabs 
         else:
             st.session_state["chat_history"].append({"role": "user", "content": _chat_input})
             with st.spinner("Claude is thinking…"):
-                from dashboard.claude_chat import call_claude
+                from dashboard.claude_chat import call_claude_router
                 _history_for_api = st.session_state["chat_history"][:-1]
-                _response = call_claude(
+                _response = call_claude_router(
                     user_message  = _chat_input,
                     reactor_df    = reactor_opts if _reactor_opts_ok else None,
                     api_key       = _api_key,
