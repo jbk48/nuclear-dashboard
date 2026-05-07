@@ -1,0 +1,528 @@
+"""
+claude_context.py — Reactor context building and geography resolution
+for the Claude action agent.
+
+Owns:
+- LEVER_SCHEMA         : lever definitions (names, types, ranges)
+- _SYSTEM_PROMPT       : action agent system prompt template
+- _lever_schema_text() : render LEVER_SCHEMA as prompt text
+- _current_state_text(): read current lever values from session state
+- _REGION_ALIASES      : geographic alias → DB region mapping
+- _COUNTRY_ALIASES     : country alias → DB country keyword mapping
+- _resolve_regions()   : detect mentioned regions in a message
+- _resolve_countries() : detect mentioned countries in a message
+- _reactor_context_text(): build the reactor context block for the system prompt
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from config import REGIONS
+
+# ── Lever schema ─────────────────────────────────────────────────────────────
+
+LEVER_SCHEMA = {
+    "extension_policy": {
+        "ss_key": "lv_ext_policy",
+        "type": "str",
+        "options": ["AcceleratedRetirement", "CurrentPolicy", "ExtendedOperations"],
+        "description": (
+            "Global reactor retirement/extension policy. "
+            "AcceleratedRetirement = no new extensions beyond currently approved licenses. "
+            "CurrentPolicy = follow each country's stated national policy. "
+            "ExtendedOperations = maximum regulatory life (US/Japan 80yr, France 60yr)."
+        ),
+    },
+    "large_reactor_uc_pct": {
+        "ss_key": "lv_large_uc_pct",
+        "type": "int",
+        "range": [0, 100],
+        "description": "Probability (%) that Under Construction large reactors complete. Default 100.",
+    },
+    "large_reactor_planned_pct": {
+        "ss_key": "lv_large_plan_pct",
+        "type": "int",
+        "range": [0, 100],
+        "description": "Probability (%) that Planned large reactors get built. Default 100.",
+    },
+    "large_reactor_proposed_pct": {
+        "ss_key": "lv_large_prop_pct",
+        "type": "int",
+        "range": [0, 100],
+        "description": "Probability (%) that Proposed large reactors get built. Default 0.",
+    },
+    "smr_uc_pct": {
+        "ss_key": "lv_smr_uc_pct",
+        "type": "int",
+        "range": [0, 100],
+        "description": "Probability (%) that SMR Under Construction units complete. Default 100.",
+    },
+    "smr_planned_pct": {
+        "ss_key": "lv_smr_plan_pct",
+        "type": "int",
+        "range": [0, 100],
+        "description": "Probability (%) that SMR Planned units get built. Default 100.",
+    },
+    "smr_proposed_pct": {
+        "ss_key": "lv_smr_prop_pct",
+        "type": "int",
+        "range": [0, 100],
+        "description": "Probability (%) that SMR Proposed units get built. Default 0.",
+    },
+    "construction_delay_years": {
+        "ss_key": "lv_delay",
+        "type": "int",
+        "options": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        "description": "Additional years of delay added to all pipeline reactor expected online dates.",
+    },
+    "smr_acceleration_start_year": {
+        "ss_key": "lv_smr_accel_start",
+        "type": "int",
+        "range": [2028, 2040],
+        "description": "Year when pre-2040 SMR acceleration (beyond announced pipeline) begins.",
+    },
+    "smr_acceleration_gw_per_year": {
+        "ss_key": "lv_smr_accel_rate",
+        "type": "float",
+        "range": [0.0, 10.0],
+        "description": "Rate of pre-2040 SMR capacity acceleration (GW/yr beyond announced pipeline).",
+    },
+    "smr_post2040_share_pct": {
+        "ss_key": "lv_smr_share_pct",
+        "type": "int",
+        "range": [0, 60],
+        "description": "Percentage of post-2040 new build capacity that comes from SMRs.",
+    },
+    "post2040_global_new_build_gw_per_year": {
+        "ss_key": "lv_post2040_gw",
+        "type": "float",
+        "range": [0.0, 80.0],
+        "description": (
+            "Global gross nuclear capacity added per year after 2040. "
+            "Reference: Decline≈10 GW/yr, Conservative≈29, Base≈28, Optimistic≈54."
+        ),
+    },
+    "china_post2040_gw_per_year": {
+        "ss_key": "lv_china_gw",
+        "type": "float",
+        "range": [0.0, 25.0],
+        "description": "China's share of post-2040 new build (GW/yr). Must not exceed global rate.",
+    },
+}
+
+_SYSTEM_PROMPT = """\
+You are an expert assistant for a nuclear capacity projection dashboard (2024–2050).
+
+## Your Job
+The user wants to explore a what-if nuclear scenario. Convert their natural language request \
+into precise structured JSON actions that will update the projection model. Then explain clearly \
+what you're proposing.
+
+## Current Lever State
+{current_state}
+
+## Reactor Database Context
+All pipeline reactors are listed below grouped by region. Use your own geographic
+and political knowledge to determine which ones belong to the area the user is
+describing — do not ask the user for reactor IDs; figure it out from the list.
+{reactor_context}
+
+## Available Levers (name → description | valid values)
+{lever_schema}
+
+## Available Regions (for synthetic builds and geographic context)
+{regions}
+
+Common geographic groupings used in the reactor context:
+- "West / Western world" → United States, Canada & Mexico, France, United Kingdom, Rest of Western Europe
+- "Europe" → France, United Kingdom, Rest of Western Europe, Eastern Europe
+- "Asia" → China, East Asia, South Asia, Southeast Asia
+
+## Response Format — return ONLY valid JSON, nothing else:
+```json
+{{
+  "message": "Clear friendly explanation of what you're proposing (2-4 sentences). Be specific about numbers and what will change.",
+  "actions": [
+    // SET A MACRO LEVER:
+    {{"type": "set_lever", "lever": "<lever_name_from_schema>", "value": <value>}},
+
+    // ADD SYNTHETIC NEW BUILDS (hypothetical reactors not in the database):
+    {{"type": "synthetic_build", "region": "<one of the available regions>", "capacity_mw": <mw_per_unit>, "per_year": <count_per_year_int>, "start_year": <2025_to_2049>, "n_years": <int>}},
+
+    // OVERRIDE A SPECIFIC REACTOR (only use IDs from reactor context above):
+    {{"type": "reactor_override", "reactor_id": "<id>", "field": "<field>", "value": <value>}}
+    // reactor_override valid fields: retirement_year (int), capacity_mw (float),
+    //   restart_date ("YYYY-MM"), status (str),
+    //   expected_online_year (int, pipeline only), pipeline_probability (0.0–1.0, pipeline only)
+  ]
+}}
+```
+
+## Rules
+- Return ONLY the JSON block. No preamble, no text after.
+- If the request is unclear, set actions:[] and ask for clarification in message.
+- Never invent reactor_ids — only use IDs from the reactor context above.
+- Lever values must be within specified ranges/options.
+- The model covers 2024–2050. Actions outside this range have no effect.
+
+- **ONLY MAKE CHANGES THE USER ASKED FOR — NO EXCEPTIONS.** If the user asks about new-build \
+  scenarios (starting, stopping, or changing construction), ONLY use reactor_override with \
+  pipeline_probability and/or synthetic_build. Do NOT touch extension_policy or increase any \
+  global pipeline rate as "compensation", context, or for any other reason not explicitly asked.
+
+- **`extension_policy` is FORBIDDEN unless the user explicitly mentions: retirement, shutdown, \
+  life extension, license renewal, or continued operations.** NEVER set extension_policy when \
+  the user asks about new construction. Here is why: changing extension_policy to \
+  ExtendedOperations causes an IMMEDIATE upward jump in capacity from 2024 because it expands \
+  ALL operating reactor lifetimes starting NOW — this is completely unrelated to new-build \
+  decisions and will produce a confusing, incorrect chart. Only touch extension_policy if the \
+  user's question is specifically about how long existing reactors will run.
+
+- **NEVER increase global pipeline rates (large_reactor_planned_pct, large_reactor_proposed_pct, \
+  smr_planned_pct, smr_proposed_pct, post2040_global_new_build_gw_per_year, etc.) when the user \
+  is asking to REDUCE or STOP builds.** These levers are GLOBAL and would incorrectly add \
+  capacity in every region, including the ones the user wants to restrict. For regional \
+  restrictions, use ONLY reactor_override with pipeline_probability=0.
+
+- GLOBAL LEVERS CANNOT TARGET REGIONS: Pipeline realization rates and post-2040 growth apply \
+  to ALL regions worldwide. If the user asks for a regional restriction (e.g. "the west stops \
+  building"), do NOT use those levers as-is — they would incorrectly affect every region. \
+  Instead: (a) use reactor_override with pipeline_probability=0 on the specific pipeline \
+  reactors in that region (use the reactor context above), and (b) for the post-2040 period \
+  follow the POST-2040 REGIONAL APPROXIMATION rule below to reduce the global rate \
+  proportionally. If no reactor context is available for that region, set actions:[] and \
+  explain the limitation.
+
+- ECONOMIC/INDIRECT SCENARIOS: If the user asks about something that doesn't directly map \
+  to a lever (e.g. "what if SMR costs drop to $5,000/kW?" or "what if there's a nuclear \
+  accident?"), reason about the likely downstream effects and translate into concrete model \
+  actions. Explain your reasoning. But still follow the ONLY MAKE CHANGES ASKED FOR rule — \
+  only implement effects that logically follow from the stated scenario.
+
+- POST-2040 REGIONAL APPROXIMATION: The post-2040 growth lever is global-only. When the \
+  user asks a region to stop or reduce large reactor builds after 2040, use the \
+  "Post-2040 Regional Build Shares" table in the reactor context — it shows each region's \
+  estimated GW/yr contribution and the pre-calculated new global rate if they stop building. \
+  Implement this as a set_lever action on post2040_global_new_build_gw_per_year using the \
+  "new rate if stops" value. Also set reactor_override pipeline_probability=0 for any \
+  pipeline reactors in that region with expected_online_year ≥ 2035. Always note in your \
+  message that the post-2040 adjustment is an approximation based on current pipeline \
+  proportions, and the user can refine it manually.
+
+- Users may ask follow-up questions to refine the scenario — treat the conversation as \
+  iterative. Each new message can add to or modify previous changes.
+
+- Macro levers are GLOBAL — they cannot target individual countries. \
+  To target a specific country, use reactor_override (for existing reactors) or \
+  synthetic_build for their region.
+- For the extension_policy lever: this affects ALL reactors globally.
+"""
+
+
+# ── Context text helpers ──────────────────────────────────────────────────────
+
+def _lever_schema_text() -> str:
+    lines = []
+    for name, spec in LEVER_SCHEMA.items():
+        if "options" in spec:
+            constraint = f"Options: {spec['options']}"
+        else:
+            r = spec["range"]
+            constraint = f"Range: {r[0]}–{r[1]}"
+        lines.append(f"- {name}: {spec['description']} | {constraint}")
+    return "\n".join(lines)
+
+
+def _current_state_text() -> str:
+    import streamlit as st
+    ss = st.session_state
+    lines = []
+    for name, spec in LEVER_SCHEMA.items():
+        val = ss.get(spec["ss_key"], "(default)")
+        lines.append(f"- {name}: {val}")
+    wi_ov = ss.get("wi_overrides", [])
+    wi_sy = ss.get("wi_synthetic", [])
+    if wi_ov:
+        lines.append(f"\nActive reactor overrides ({len(wi_ov)}):")
+        for o in wi_ov:
+            lines.append(f"  {o['reactor_name']} ({o['country']}): {o['field']} → {o['value']}")
+    if wi_sy:
+        lines.append(f"\nActive synthetic builds ({len(wi_sy)}):")
+        for s in wi_sy:
+            lines.append(f"  {s['label']}")
+    return "\n".join(lines)
+
+
+# ── Geography resolution ──────────────────────────────────────────────────────
+
+# Region aliases → list of DB region names they map to
+# DB regions: United States | Canada & Mexico | France | United Kingdom |
+#             Rest of Western Europe | Eastern Europe | Russia | China |
+#             East Asia | South Asia | Southeast Asia | Emerging & Rest
+_REGION_ALIASES: dict[str, list[str]] = {
+    "west":              ["United States", "Canada & Mexico", "France",
+                          "United Kingdom", "Rest of Western Europe"],
+    "western":           ["United States", "Canada & Mexico", "France",
+                          "United Kingdom", "Rest of Western Europe"],
+    "western world":     ["United States", "Canada & Mexico", "France",
+                          "United Kingdom", "Rest of Western Europe"],
+    "western countries": ["United States", "Canada & Mexico", "France",
+                          "United Kingdom", "Rest of Western Europe"],
+    "europe":            ["France", "United Kingdom", "Rest of Western Europe", "Eastern Europe"],
+    "european":          ["France", "United Kingdom", "Rest of Western Europe", "Eastern Europe"],
+    "western europe":    ["France", "United Kingdom", "Rest of Western Europe"],
+    "eastern europe":    ["Eastern Europe"],
+    "north america":     ["United States", "Canada & Mexico"],
+    "asia":              ["China", "East Asia", "South Asia", "Southeast Asia"],
+    "east asia":         ["China", "East Asia"],
+    "south asia":        ["South Asia"],
+    "southeast asia":    ["Southeast Asia"],
+    "middle east":       ["Emerging & Rest"],
+    "africa":            ["Emerging & Rest"],
+    "global":            [],   # empty = don't filter; handled separately
+}
+
+
+def _resolve_regions(msg_lower: str, all_regions: list[str]) -> list[str]:
+    """Return DB region names mentioned directly or via alias in msg_lower."""
+    matched: set[str] = set()
+    regions_lower = {r.lower(): r for r in all_regions}
+
+    # 1. Direct match: region name appears as substring in message
+    for r_low, r_orig in regions_lower.items():
+        if r_low in msg_lower:
+            matched.add(r_orig)
+
+    # 2. Alias match
+    for alias, target_regions in _REGION_ALIASES.items():
+        if alias in msg_lower:
+            for tr in target_regions:
+                if tr in all_regions:
+                    matched.add(tr)
+
+    return list(matched)
+
+
+# Common country aliases → canonical DB name keywords
+_COUNTRY_ALIASES: dict[str, list[str]] = {
+    "us":            ["united states"],
+    "usa":           ["united states"],
+    "america":       ["united states"],
+    "united states": ["united states"],
+    "uk":            ["united kingdom"],
+    "britain":       ["united kingdom"],
+    "england":       ["united kingdom"],
+    "korea":         ["korea"],
+    "south korea":   ["korea"],
+    "uae":           ["arab emirates"],
+    "emirates":      ["arab emirates"],
+    "russia":        ["russia", "russian"],
+    "iran":          ["iran", "islamic republic"],
+    "czech":         ["czech"],
+    "slovakia":      ["slovak"],
+}
+
+
+def _resolve_countries(msg_lower: str, all_countries: list[str]) -> list[str]:
+    """
+    Return the list of DB country names mentioned (directly or via alias) in msg_lower.
+    Countries in the DB are stored in ALL CAPS (e.g. 'UNITED STATES OF AMERICA').
+    """
+    matched: set[str] = set()
+    countries_lower = {c.lower(): c for c in all_countries}
+
+    # 1. Direct substring match
+    for c_low, c_orig in countries_lower.items():
+        if c_low in msg_lower:
+            matched.add(c_orig)
+
+    # 2. Alias match
+    msg_words = msg_lower
+    for alias, keywords in _COUNTRY_ALIASES.items():
+        if alias in msg_words:
+            for kw in keywords:
+                for c_low, c_orig in countries_lower.items():
+                    if kw in c_low:
+                        matched.add(c_orig)
+
+    # 3. Bidirectional: any word from the message (len≥4) appears in a country name
+    for word in msg_lower.split():
+        if len(word) >= 4:
+            for c_low, c_orig in countries_lower.items():
+                if word in c_low:
+                    matched.add(c_orig)
+
+    return list(matched)
+
+
+# ── Reactor context builder ───────────────────────────────────────────────────
+
+def _reactor_context_text(reactor_df, user_message: str) -> str:
+    """
+    Build reactor context for Claude.
+
+    Strategy:
+    - PIPELINE reactors (UC / Planned / Proposed): always include ALL of them,
+      grouped by region. Claude uses its own geographic reasoning to identify
+      which ones apply — no aliases needed.
+    - OPERATING fleet: only include when a specific country/region is detected
+      in the query (retirement/extension scenarios). Otherwise show summary only.
+    """
+    if reactor_df is None or reactor_df.empty:
+        return "Reactor database not available."
+
+    _PIPELINE_STATUSES = {"UnderConstruction", "Planned", "Proposed"}
+    pipeline_df  = reactor_df[reactor_df["status"].isin(_PIPELINE_STATUSES)].copy()
+    operating_df = reactor_df[reactor_df["status"] == "Operating"].copy()
+
+    lines: list[str] = []
+
+    # ── 1. Full pipeline context (always included) ────────────────────────
+    lines.append(
+        f"## ALL Pipeline Reactors ({len(pipeline_df)} total — UC / Planned / Proposed)\n"
+        "Use your geographic and political knowledge to determine which reactors\n"
+        "belong to the region/bloc the user is asking about (e.g. 'the west',\n"
+        "'NATO members', 'OECD', specific countries). IDs are required for overrides.\n"
+        "expected_online_year shown where available."
+    )
+
+    if "region" in pipeline_df.columns:
+        for region, grp in pipeline_df.groupby("region", sort=True):
+            lines.append(f"\n--- {region} ({len(grp)} reactors) ---")
+            for _, row in grp.iterrows():
+                rid      = row.get("reactor_id", "")
+                name     = row.get("name", "")
+                ctry     = row.get("country", "")
+                status   = row.get("status", "")
+                cap      = row.get("net_capacity_mw", 0)
+                yr       = row.get("expected_online_year", "")
+                rtype    = row.get("reactor_type", "") or ""
+                rmodel   = row.get("reactor_model", "") or ""
+                is_smr   = row.get("is_smr", 0)
+                supplier = row.get("nsss_supplier", "") or ""
+                prob     = row.get("pipeline_probability", None)
+                model_part = f"·{rmodel}" if rmodel else ""
+                smr_part   = "·SMR" if is_smr else ""
+                type_tag   = f" [{rtype}{model_part}{smr_part}]" if rtype else (" [SMR]" if is_smr else "")
+                sup_str    = f" | oem={supplier}" if supplier else ""
+                prob_str   = (f" | p={prob:.0%}"
+                              if prob is not None and not (isinstance(prob, float) and prob != prob)
+                              else "")
+                lines.append(
+                    f"  id={rid} | {name} | {ctry} | {status}{type_tag}"
+                    f" | {cap:.0f} MW" + (f" | online ~{yr}" if yr else "")
+                    + sup_str + prob_str
+                )
+    else:
+        for _, row in pipeline_df.iterrows():
+            rid      = row.get("reactor_id", "")
+            name     = row.get("name", "")
+            ctry     = row.get("country", "")
+            status   = row.get("status", "")
+            cap      = row.get("net_capacity_mw", 0)
+            yr       = row.get("expected_online_year", "")
+            rtype    = row.get("reactor_type", "") or ""
+            rmodel   = row.get("reactor_model", "") or ""
+            is_smr   = row.get("is_smr", 0)
+            supplier = row.get("nsss_supplier", "") or ""
+            prob     = row.get("pipeline_probability", None)
+            model_part = f"·{rmodel}" if rmodel else ""
+            smr_part   = "·SMR" if is_smr else ""
+            type_tag   = f" [{rtype}{model_part}{smr_part}]" if rtype else (" [SMR]" if is_smr else "")
+            sup_str    = f" | oem={supplier}" if supplier else ""
+            prob_str   = (f" | p={prob:.0%}"
+                          if prob is not None and not (isinstance(prob, float) and prob != prob)
+                          else "")
+            lines.append(
+                f"  id={rid} | {name} | {ctry} | {status}{type_tag} | {cap:.0f} MW"
+                + (f" | online ~{yr}" if yr else "") + sup_str + prob_str
+            )
+
+    # ── 2. Operating fleet — only when geography detected ─────────────────
+    msg_lower     = user_message.lower()
+    all_countries = (operating_df["country"].dropna().unique().tolist()
+                     if "country" in operating_df.columns else [])
+    all_regions   = (operating_df["region"].dropna().unique().tolist()
+                     if "region"  in operating_df.columns else [])
+
+    mentioned_countries = _resolve_countries(msg_lower, all_countries)
+    mentioned_regions   = _resolve_regions(msg_lower, all_regions)
+
+    if mentioned_countries or mentioned_regions:
+        mask = operating_df["country"].isin(mentioned_countries)
+        if "region" in operating_df.columns:
+            mask = mask | operating_df["region"].isin(mentioned_regions)
+        op_filtered = operating_df[mask]
+
+        lines.append(
+            f"\n## Operating Fleet — {', '.join(mentioned_countries + mentioned_regions)}"
+            f" ({len(op_filtered)} reactors, for retirement/extension overrides)"
+        )
+        for _, row in op_filtered.iterrows():
+            rid      = row.get("reactor_id", "")
+            name     = row.get("name", "")
+            ctry     = row.get("country", "")
+            cap      = row.get("net_capacity_mw", 0)
+            ret_dt   = row.get("retirement_date_used", "") or ""
+            cod      = row.get("commercial_operation_date", "") or ""
+            rtype    = row.get("reactor_type", "") or ""
+            rmodel   = row.get("reactor_model", "") or ""
+            is_smr   = row.get("is_smr", 0)
+            supplier = row.get("nsss_supplier", "") or ""
+            restart  = row.get("restart_date", "") or ""
+            model_part  = f"·{rmodel}" if rmodel else ""
+            smr_part    = "·SMR" if is_smr else ""
+            type_tag    = f" [{rtype}{model_part}{smr_part}]" if rtype else ""
+            cod_year    = f" | online {cod[:4]}" if cod else ""
+            ret_str     = f" | retires {ret_dt[:7]}" if ret_dt else ""
+            sup_str     = f" | oem={supplier}" if supplier else ""
+            restart_str = (f" | restarted {restart[:7]}"
+                           if restart and row.get("status") == "Restarted" else "")
+            lines.append(
+                f"  id={rid} | {name} | {ctry} | Operating{type_tag} | {cap:.0f} MW"
+                f"{cod_year}{ret_str}{sup_str}{restart_str}"
+            )
+    else:
+        lines.append(
+            f"\n## Operating Fleet ({len(operating_df)} reactors)\n"
+            "For retirement/extension overrides: mention a specific country or region\n"
+            "and the operating reactor IDs for that area will be shown."
+        )
+
+    # ── 3. Post-2040 regional build share estimates ───────────────────────
+    try:
+        import streamlit as _st_shares
+        _p40_gw   = float(_st_shares.session_state.get("lv_post2040_gw", 28.1))
+        _china_gw = float(_st_shares.session_state.get("lv_china_gw",    8.0))
+        _smr_pct  = float(_st_shares.session_state.get("lv_smr_share_pct", 20))
+    except Exception:
+        _p40_gw, _china_gw, _smr_pct = 28.1, 8.0, 20.0
+
+    _smr_share    = _smr_pct / 100.0
+    _row_gw       = max(0.0, _p40_gw - _china_gw)
+    _row_large_gw = _row_gw * (1.0 - _smr_share)
+
+    if "region" in pipeline_df.columns:
+        _region_mw: dict[str, float] = {}
+        for _, _pr in pipeline_df.iterrows():
+            if str(_pr.get("region", "")) == "China":
+                continue
+            if _pr.get("is_smr", False):
+                continue
+            _r = str(_pr.get("region", "Other"))
+            _region_mw[_r] = _region_mw.get(_r, 0.0) + float(_pr.get("net_capacity_mw", 0) or 0)
+
+        _total_row_mw = sum(_region_mw.values()) or 1.0
+        lines.append("\n## Post-2040 Regional Build Shares (large reactors, excl. China)")
+        lines.append(
+            f"Global post-2040 rate: {_p40_gw} GW/yr | China carve-out: {_china_gw} GW/yr | "
+            f"RoW large reactor rate: {_row_large_gw:.1f} GW/yr"
+        )
+        lines.append(f"{'Region':<30} {'Est. GW/yr':>10}  {'New global rate if stops':>26}")
+        for _reg, _mw in sorted(_region_mw.items(), key=lambda x: -x[1]):
+            _share   = _mw / _total_row_mw
+            _reg_gw  = round(_row_large_gw * _share, 2)
+            _new_p40 = round(_p40_gw - _reg_gw, 2)
+            lines.append(f"  {_reg:<28} {_reg_gw:>10.2f}  {_new_p40:>26.2f}")
+
+    return "\n".join(lines)

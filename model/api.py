@@ -151,7 +151,10 @@ def get_reactor_options(
                COALESCE(net_capacity_mw, 0) as net_capacity_mw,
                retirement_date_used, restart_date,
                commercial_operation_date,
-               expected_online_year
+               expected_online_year,
+               reactor_type, reactor_model, is_smr,
+               nsss_supplier,
+               pipeline_probability
         FROM reactors
         WHERE status IN (
             'Operating','Restarted','LongTermShutdown',
