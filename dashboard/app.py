@@ -105,6 +105,7 @@ from plain-language descriptions (e.g. *"retire all Canadian reactors in 2033"*)
 - The geography filter (sidebar) restricts all charts and KPIs to selected regions
 - Post-2040 projections switch to a top-down growth-rate model; treat those years as directional only
 """)
+    st.markdown("**by Jack Kochansky with Claude Code**")
     return False
 
 if not _check_password():
