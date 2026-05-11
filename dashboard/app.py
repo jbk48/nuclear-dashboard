@@ -514,3 +514,5 @@ st.caption(
     "Model: bottom-up unit-level (2024–2040) → top-down growth bridge (2040–2050)  ·  "
     "For research & educational use only — scenario outputs, not forecasts"
 )
+
+st.markdown("**by Jack Kochansky with Claude Code**")
