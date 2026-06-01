@@ -66,7 +66,10 @@ def _check_password() -> bool:
     pwd = st.text_input("Password", type="password", key="_pwd_input",
                         placeholder="Enter password to continue")
     if st.button("Enter", type="primary"):
-        expected = st.secrets.get("APP_PASSWORD", "")
+        try:
+            expected = st.secrets.get("APP_PASSWORD", "")
+        except Exception:
+            expected = ""
         if pwd == expected:
             st.session_state["_authenticated"] = True
             st.rerun()
